@@ -1,0 +1,31 @@
+{
+  "name": "LabelTool",
+  "description": "A quick repackaging of Karmatics Aardvark extension",
+  "version": "1.2",
+  "permissions": [
+    "activeTab"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": false
+  },
+  "content_security_policy": "script-src 'self' 'unsafe-eval'; object-src 'self'",
+
+  "browser_action": {
+      "default_title": "Launch Aardvark Page Editor",
+      "default_icon": "resources/icon.png"
+  },
+  "web_accessible_resources": [
+    "allinone.js",
+    "resources/*",
+    "aardvarkStrings.js",
+    "aardvarkUtils.js",
+    "aardvarkDBox.js",
+    "aardvarkCommands.js",
+    "aardvarkMain.js",
+    "uniqueSelector.js"
+  ],
+  "manifest_version": 2
+}

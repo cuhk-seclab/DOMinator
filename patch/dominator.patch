@@ -1,0 +1,3559 @@
+diff --git a/bindings/IDLExtendedAttributes.txt b/bindings/IDLExtendedAttributes.txt
+index c5717fab9..87abba5ac 100644
+--- a/bindings/IDLExtendedAttributes.txt
++++ b/bindings/IDLExtendedAttributes.txt
+@@ -39,7 +39,7 @@ CSSProperty
+ CachedAccessor=*
+ CachedAttribute=*
+ CallWith=ExecutionContext|Isolate|ScriptState|ThisValue
+-CheckSecurity=Receiver|ReturnValue
++CheckSecurity=Receiver|ReturnValue|CPPRead|CPPWrite
+ Clamp
+ Constructor
+ # FIXME: remove [ConstructorCallWith=Document], as can instead use
+diff --git a/bindings/bindings.gni b/bindings/bindings.gni
+index 161113eec..2224b1fb7 100644
+--- a/bindings/bindings.gni
++++ b/bindings/bindings.gni
+@@ -15,6 +15,8 @@ bindings_core_v8_files =
+                     "core/v8/array_value.h",
+                     "core/v8/binding_security.cc",
+                     "core/v8/binding_security.h",
++                    "core/v8/cpp_security.cc",
++                    "core/v8/cpp_security.h",
+                     "core/v8/boxed_v8_module.h",
+                     "core/v8/callback_invoke_helper.cc",
+                     "core/v8/callback_invoke_helper.h",
+diff --git a/bindings/core/v8/binding_security.cc b/bindings/core/v8/binding_security.cc
+index c88962aa7..425b7ad03 100644
+--- a/bindings/core/v8/binding_security.cc
++++ b/bindings/core/v8/binding_security.cc
+@@ -47,6 +47,12 @@
+ #include "third_party/blink/renderer/platform/web_test_support.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ 
++#include "third_party/blink/renderer/core/style/policy_data.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++#include "third_party/blink/renderer/core/dom/node_computed_style.h"
++#include "third_party/blink/renderer/core/dom/events/event_target.h"
++#include <iostream>
++#include "base/environment.h"
+ namespace blink {
+ 
+ namespace {
+@@ -530,4 +536,201 @@ bool BindingSecurity::ShouldAllowNamedAccessTo(
+   return true;
+ }
+ 
++bool BindingSecurity::CPPCheckAccess(EventTarget* event_node, const uint8_t value)
++{
++    Node* node=event_node->ToNode();
++    if (!node){
++      return true;
++    }
++    node->GetDocument().AccessCount();
++    if(!node->isConnected()||!node->IsHTMLElement()){
++      return true;
++    }
++    const PolicyData* policydata = node->GetContentProtectionPolicyData();
++    bool report_mode_=IsReportModeEnabled();
++    //Only provide protection for resources with policy 
++    if(!policydata&&!report_mode_){
++      return true;
++    }
++
++    v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++    if (frame.IsEmpty())
++      return true;
++    v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++    
++    String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++
++    const KURL callerSourceURL = KURL(frameSourceURL);   
++    const KURL origin_url = node->GetDocument().BaseURL();
++
++    //FirstParty Url Check
++    if(origin_url.Host()==callerSourceURL.Host()){
++      return true;
++    }
++
++    // ByPass for Monkey Testing
++    if (frameSourceURL.Utf8().find("gremlins")!=std::string::npos){
++      return true;
++    }
++    
++    if(IsChromeURL(callerSourceURL)||IsExtensionURL(callerSourceURL)){
++      return true;
++    }
++    if (!node->GetDocument().IsInMainFrame()) {
++      return true;
++    }
++    int recordID=node->GetDocument().ThirdpartyAccessCount();
++    bool allowed_log=true;
++    if (recordID>100000){
++      allowed_log=false;
++    }
++    //Log for ReportMode
++    if(report_mode_&&!policydata){
++      if(allowed_log){
++      FILE *fp=node->GetDocument().getAccessLog();
++      fprintf(fp,"{\"info\" : %d , \"Name\": \"%s\" , \"ScriptUrl\" : \"%s\" , \"Origin Url\": \"%s\" , \"Access\" : %d , \"NodeID\" : %s , \"ScriptID\": %d }\n", 
++        recordID , node->nodeName().Utf8().c_str(),frameSourceURL.Utf8().c_str(),origin_url.GetString().Utf8().c_str(),value,node->nid()?node->nid().Utf8().c_str():"-1",frame->GetScriptId());
++      fflush(fp);
++      }
++      return true;
++    } 
++
++    if(policydata->PoliciesMatch(callerSourceURL,value)){
++      node->GetDocument().AllowedAccessCount();
++      return true;
++    }
++    else if (allowed_log){
++      FILE *fp=node->GetDocument().getViolationLog();
++      node->GetDocument().DeniedAccessCount();
++      fprintf(fp,"{\"info\" : %d , \"Name\": \"%s\" , \"ScriptUrl\" : \"%s\" , \"Origin Url\": \"%s\" , \"Access\" : %d , \"NodeID\" : %s , \"ScriptID\": %d }\n", 
++        recordID , node->nodeName().Utf8().c_str(),frameSourceURL.Utf8().c_str(),origin_url.GetString().Utf8().c_str(),value,node->nid()?node->nid().Utf8().c_str():"-1",frame->GetScriptId());
++      fflush(fp);
++    }
++    return false;
++}
++
++
++bool BindingSecurity::CPPCheckAccess(const Element& element, const uint8_t value)
++{
++    const Node *node = &element;
++    const PolicyData* policydata = node->GetContentProtectionPolicyData();
++    bool report_mode_=IsReportModeEnabled();
++    //Only provide protection for resources with policy 
++    if(!policydata&&!report_mode_){
++      return true;
++    }
++
++    v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++    if (frame.IsEmpty())
++      return true;
++    v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++
++    const KURL callerSourceURL = KURL(frameSourceURL);   
++    const KURL origin_url = node->GetDocument().BaseURL();
++
++    //FirstParty Url Check
++    if(origin_url.Host()==callerSourceURL.Host()){
++      return true;
++    }
++
++    // ByPass for Monkey Testing
++    if (frameSourceURL.Utf8().find("gremlins")!=std::string::npos){
++      return true;
++    }
++    
++    if(IsChromeURL(callerSourceURL)||IsExtensionURL(callerSourceURL)){
++      return true;
++    }
++    if (!node->GetDocument().IsInMainFrame()) {
++      return true;
++    }
++    int recordID=node->GetDocument().ThirdpartyAccessCount();
++    bool allowed_log=true;
++    if (recordID>100000){
++      allowed_log=false;
++    }
++
++    if(policydata->PoliciesMatch(callerSourceURL,value)){
++      node->GetDocument().AllowedAccessCount();
++      return true;
++    }
++    else if (allowed_log){
++      FILE *fp=node->GetDocument().getViolationLog();
++      node->GetDocument().DeniedAccessCount();
++      fprintf(fp,"{\"info\" : %d , \"Name\": \"%s\" , \"ScriptUrl\" : \"%s\" , \"Origin Url\": \"%s\" , \"Access\" : %d , \"NodeID\" : %s , \"ScriptID\": %d }\n", 
++        recordID , node->nodeName().Utf8().c_str(),frameSourceURL.Utf8().c_str(),origin_url.GetString().Utf8().c_str(),value,node->nid()?node->nid().Utf8().c_str():"-1",frame->GetScriptId());
++      fflush(fp);
++    }
++    return false;
++}
++
++bool BindingSecurity::IsChromeURL(const KURL& url) {
++  const String protocol=url.Protocol();
++  if (protocol.IsEmpty() || protocol == "chrome" ||
++      protocol == "chrome-devtools" || protocol == "chrome-search") {
++    return true;
++  }
++  return false;
++}
++
++bool BindingSecurity::IsExtensionURL(const KURL& url) {
++  const String protocol=url.Protocol();
++  return protocol == "chrome-extension";
++}
++
++bool BindingSecurity::IsReportModeEnabled() {
++  static bool initialized = false;
++  static bool enabled = false;
++  if (initialized)
++      return enabled;
++  
++  std::unique_ptr<base::Environment> env(base::Environment::Create());
++  enabled = env->HasVar("REPORT_MODE");
++
++  initialized = true;
++  return enabled;
++}
++
++bool BindingSecurity::IsGenerationModeEnabled() {
++  static bool initialized = false;
++  static bool enabled = false;
++  if (initialized)
++      return enabled;
++  std::unique_ptr<base::Environment> env(base::Environment::Create());
++  enabled = env->HasVar("G_MODE");
++  initialized = true;
++  return enabled;
++}
++void BindingSecurity::SetNodeAndChildrenInitiator(
++    Node& node,
++    bool setChildren) {
++
++  if (node.IsPseudoElement())
++    return;
++
++  v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++  String initiator = "";
++  String frameSourceURL ="Unknown";
++
++  if (!frame.IsEmpty()){
++    v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++    frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++  }
++  else {
++    return;
++  }
++  const KURL callerSourceURL = KURL(frameSourceURL);
++  initiator=frameSourceURL;
++
++  if (setChildren) {
++    if(node.IsHTMLElement()){
++      DynamicTo<HTMLElement>(node)->setChildrenInitiator(initiator);
++    }
++  }
++  else {
++    if(node.IsHTMLElement()){
++      DynamicTo<HTMLElement>(node)->setInitiator(initiator);
++    }
++  }
++}
+ }  // namespace blink
+diff --git a/bindings/core/v8/binding_security.h b/bindings/core/v8/binding_security.h
+index 19f114b10..9ff2e72ec 100644
+--- a/bindings/core/v8/binding_security.h
++++ b/bindings/core/v8/binding_security.h
+@@ -35,6 +35,7 @@
+ #include "third_party/blink/renderer/platform/bindings/binding_security_for_platform.h"
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+ #include "v8/include/v8.h"
++#include "third_party/blink/renderer/core/dom/events/event_target.h"
+ 
+ namespace blink {
+ 
+@@ -44,7 +45,9 @@ class Frame;
+ class LocalDOMWindow;
+ class Location;
+ class Node;
++class Element;
+ struct WrapperTypeInfo;
++class KURL;
+ 
+ // BindingSecurity provides utility functions that determine access permission
+ // between two realms. For example, is the current Window allowed to access the
+@@ -139,6 +142,18 @@ class CORE_EXPORT BindingSecurity {
+                                    const WrapperTypeInfo*,
+                                    v8::Local<v8::Object> holder);
+ 
++ static bool CPPCheckAccess(EventTarget* event_node, const uint8_t value);
++ static bool CPPCheckAccess(const Element& element, const uint8_t value);
++ 
++ static bool IsChromeURL(const KURL&);
++ static bool IsExtensionURL(const KURL&);
++
++ static bool IsReportModeEnabled();
++ static bool IsGenerationModeEnabled();
++ static void SetNodeAndChildrenInitiator(
++                                    // Document* document,
++                                    Node& node,
++                                    bool setChildren);
+  private:
+   // Returns true if |accessingWindow| is allowed named access to |targetWindow|
+   // because they're the same origin.  Note that named access should be allowed
+diff --git a/bindings/core/v8/callback_invoke_helper.h b/bindings/core/v8/callback_invoke_helper.h
+index c499eda79..84a7f55fb 100644
+--- a/bindings/core/v8/callback_invoke_helper.h
++++ b/bindings/core/v8/callback_invoke_helper.h
+@@ -78,6 +78,10 @@ class CallbackInvokeHelper final {
+     return v8::Just<ReturnType>(result);
+   }
+ 
++  int GetFunctionScriptID(){
++    return function_->ScriptId();
++  }
++
+  private:
+   bool Abort() {
+     aborted_ = true;
+diff --git a/bindings/core/v8/cpp_security.cc b/bindings/core/v8/cpp_security.cc
+new file mode 100644
+index 000000000..1b9736b73
+--- /dev/null
++++ b/bindings/core/v8/cpp_security.cc
+@@ -0,0 +1,30 @@
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++namespace blink {
++
++v8::Local<v8::StackFrame> getBottomFrame(size_t maxStackSize)
++{
++    v8::Isolate* isolate = v8::Isolate::GetCurrent();
++    if (!isolate->InContext())
++      return v8::Local<v8::StackFrame>();
++    v8::EscapableHandleScope handleScope(isolate);
++    v8::Local<v8::StackTrace> stackTrace = v8::StackTrace::CurrentStackTrace(
++      isolate, maxStackSize, stackTraceOptions);
++
++    if (stackTrace.IsEmpty() || stackTrace->GetFrameCount() <= 0)
++      return v8::Local<v8::StackFrame>();
++    int index = stackTrace->GetFrameCount() - 1;
++    return handleScope.Escape(stackTrace->GetFrame(isolate,index));
++}
++
++String toCoreStringOrDefault(const v8::Local<v8::String>& v8_string,
++    const String& dflt)
++{
++    if (v8_string.IsEmpty())
++        return dflt;
++    return ToCoreString(v8_string);
++}
++
++} // namespace blink
+diff --git a/bindings/core/v8/cpp_security.h b/bindings/core/v8/cpp_security.h
+new file mode 100644
+index 000000000..9017121bb
+--- /dev/null
++++ b/bindings/core/v8/cpp_security.h
+@@ -0,0 +1,26 @@
++#ifndef CPPSecurity_h
++#define CPPSecurity_h
++
++#include "third_party/blink/renderer/platform/wtf/forward.h"
++
++#include <v8.h>
++#include <unordered_set>
++
++namespace blink {
++
++const v8::StackTrace::StackTraceOptions stackTraceOptions = static_cast<v8::StackTrace::StackTraceOptions>(
++      v8::StackTrace::kLineNumber
++    | v8::StackTrace::kColumnOffset
++    | v8::StackTrace::kScriptId
++    | v8::StackTrace::kScriptNameOrSourceURL
++    | v8::StackTrace::kFunctionName);
++
++static const size_t maxCallStackSizeToCapture = 200;
++
++v8::Local<v8::StackFrame> getBottomFrame(size_t maxStackSize);
++
++String toCoreStringOrDefault(const v8::Local<v8::String>&, const String&);
++
++} // namespace blink
++
++#endif // ScriptCallStackFactory_h
+diff --git a/bindings/core/v8/js_event_handler_for_content_attribute.cc b/bindings/core/v8/js_event_handler_for_content_attribute.cc
+index 77d95d30e..cefa8d1dd 100644
+--- a/bindings/core/v8/js_event_handler_for_content_attribute.cc
++++ b/bindings/core/v8/js_event_handler_for_content_attribute.cc
+@@ -12,6 +12,9 @@
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/html/forms/html_form_element.h"
+ 
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++#include "third_party/blink/renderer/core/dom/document.h"
++
+ namespace blink {
+ 
+ JSEventHandlerForContentAttribute* JSEventHandlerForContentAttribute::Create(
+@@ -37,11 +40,19 @@ JSEventHandlerForContentAttribute::JSEventHandlerForContentAttribute(
+       did_compile_(false),
+       function_name_(name.LocalName()),
+       script_body_(value),
+-      source_url_(context->Url().GetString()),
++      // source_url_(context->Url().GetString()),
+       position_(To<LocalDOMWindow>(context)
+                     ->GetScriptController()
+                     .EventHandlerPosition()),
+-      isolate_(context->GetIsolate()) {}
++      isolate_(context->GetIsolate()) {
++        v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++        String frameSourceURL="Unknown";
++        if(!frame.IsEmpty()){
++          v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++          frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++        }
++        source_url_=frameSourceURL;
++      }
+ 
+ v8::Local<v8::Value> JSEventHandlerForContentAttribute::GetListenerObject(
+     EventTarget& event_target) {
+@@ -235,6 +246,8 @@ v8::Local<v8::Value> JSEventHandlerForContentAttribute::GetCompiledHandler(
+   // and whose callback context is settings object.
+   compiled_function->SetName(V8String(isolate, function_name_));
+   SetCompiledHandler(script_state_of_event_target, compiled_function);
++  int scriptID=compiled_function->ScriptId();
++  document->setScriptID2URL(scriptID, source_url_);
+ 
+   return JSEventHandler::GetListenerObject(event_target);
+ }
+diff --git a/bindings/core/v8/js_event_listener.cc b/bindings/core/v8/js_event_listener.cc
+index 4c3ca16d4..768cb7222 100644
+--- a/bindings/core/v8/js_event_listener.cc
++++ b/bindings/core/v8/js_event_listener.cc
+@@ -54,6 +54,7 @@ void JSEventListener::InvokeInternal(EventTarget&,
+               : V8EventListener::IgnorePause::kDontIgnore)) {
+     return;
+   }
++
+   v8::Maybe<void> maybe_result = event_listener_->InvokeWithoutRunnabilityCheck(
+       event.currentTarget(), &event);
+   ALLOW_UNUSED_LOCAL(maybe_result);
+diff --git a/bindings/core/v8/script_controller.cc b/bindings/core/v8/script_controller.cc
+index 0afb6f4a0..6621687c8 100644
+--- a/bindings/core/v8/script_controller.cc
++++ b/bindings/core/v8/script_controller.cc
+@@ -236,8 +236,11 @@ void ScriptController::ExecuteJavaScriptURL(
+   //
+   // We pass |SanitizeScriptErrors::kDoNotSanitize| because |muted errors| is
+   // false by default.
++
++  KURL tmp_url=KURL(url.JsUrlInitiator_);
++  
+   ClassicScript* script = MakeGarbageCollected<ClassicScript>(
+-      ScriptSourceCode(script_source, ScriptSourceLocationType::kJavascriptUrl),
++      ScriptSourceCode(script_source, ScriptSourceLocationType::kJavascriptUrl, nullptr, tmp_url),
+       base_url, ScriptFetchOptions(), SanitizeScriptErrors::kDoNotSanitize);
+ 
+   DCHECK_EQ(&window_->GetScriptController(), this);
+diff --git a/bindings/scripts/bind_gen/callback_interface.py b/bindings/scripts/bind_gen/callback_interface.py
+index 31793e597..5e67178dd 100644
+--- a/bindings/scripts/bind_gen/callback_interface.py
++++ b/bindings/scripts/bind_gen/callback_interface.py
+@@ -369,7 +369,6 @@ def generate_callback_interfaces(task_queue):
+     assert isinstance(task_queue, TaskQueue)
+ 
+     web_idl_database = package_initializer().web_idl_database()
+-
+     for callback_interface in web_idl_database.callback_interfaces:
+         task_queue.post_task(generate_callback_interface,
+                              callback_interface.identifier)
+diff --git a/bindings/scripts/bind_gen/codegen_utils.py b/bindings/scripts/bind_gen/codegen_utils.py
+index b7ddd145e..b85a2314f 100644
+--- a/bindings/scripts/bind_gen/codegen_utils.py
++++ b/bindings/scripts/bind_gen/codegen_utils.py
+@@ -105,7 +105,6 @@ def write_code_node_to_file(code_node, filepath):
+     assert isinstance(filepath, str)
+ 
+     rendered_text = render_code_node(code_node)
+-
+     format_result = style_format.auto_format(rendered_text, filename=filepath)
+     if not format_result.did_succeed:
+         raise RuntimeError("Style-formatting failed: filename = {filename}\n"
+diff --git a/bindings/scripts/bind_gen/dictionary.py b/bindings/scripts/bind_gen/dictionary.py
+index b39f01004..cabe07a34 100644
+--- a/bindings/scripts/bind_gen/dictionary.py
++++ b/bindings/scripts/bind_gen/dictionary.py
+@@ -1197,6 +1197,6 @@ def generate_dictionaries(task_queue):
+     assert isinstance(task_queue, TaskQueue)
+ 
+     web_idl_database = package_initializer().web_idl_database()
+-
+     for dictionary in web_idl_database.dictionaries:
+         task_queue.post_task(generate_dictionary, dictionary.identifier)
++        
+\ No newline at end of file
+diff --git a/bindings/scripts/bind_gen/enumeration.py b/bindings/scripts/bind_gen/enumeration.py
+index 61755ec4e..6e2e1d560 100644
+--- a/bindings/scripts/bind_gen/enumeration.py
++++ b/bindings/scripts/bind_gen/enumeration.py
+@@ -368,7 +368,6 @@ def generate_enumeration(enumeration_identifier):
+ 
+ def generate_enumerations(task_queue):
+     assert isinstance(task_queue, TaskQueue)
+-
+     web_idl_database = package_initializer().web_idl_database()
+ 
+     for enumeration in web_idl_database.enumerations:
+diff --git a/bindings/scripts/bind_gen/interface.py b/bindings/scripts/bind_gen/interface.py
+index b7e4918a6..b8772abe8 100644
+--- a/bindings/scripts/bind_gen/interface.py
++++ b/bindings/scripts/bind_gen/interface.py
+@@ -874,6 +874,32 @@ def make_check_security_of_return_value(cg_context):
+ 
+     check_security = cg_context.member_like.extended_attributes.value_of(
+         "CheckSecurity")
++
++    if check_security == "CPPWrite":
++        node = SequenceNode([
++            T("// [CheckSecurity=CPPWrite]"),
++            CxxLikelyIfNode(
++                cond="!BindingSecurity::CPPCheckAccess(${blink_receiver},2)",
++                body=T("return;")),
++        ])
++        node.accumulate(
++            CodeGenAccumulator.require_include_headers([
++                "third_party/blink/renderer/bindings/core/v8/binding_security.h",
++            ]))
++        return node
++
++    if check_security == "CPPRead":
++        node = SequenceNode([
++            T("// [CheckSecurity=CPPRead]"),
++            CxxLikelyIfNode(
++                cond="!BindingSecurity::CPPCheckAccess(${blink_receiver},1)",
++                body=T("return;")),
++        ])
++        node.accumulate(
++            CodeGenAccumulator.require_include_headers([
++                "third_party/blink/renderer/bindings/core/v8/binding_security.h",
++            ]))
++        return node
+     if check_security != "ReturnValue":
+         return None
+ 
+@@ -1692,6 +1718,31 @@ def _make_empty_callback_def(cg_context, function_name):
+     return func_def
+ 
+ 
++def make_cpp_attribute_security_check(cg_context):
++    if cg_context.class_like.identifier in ["HTMLElement", "Element", "Node"] or (
++        cg_context.class_like.inherited and cg_context.class_like.inherited.identifier == "HTMLElement"):
++        T=TextNode
++        if cg_context.attribute_get:
++            node = SequenceNode([
++                T("// [CPPAttributeSecurity: Read]"),
++                CxxLikelyIfNode(
++                    cond="!BindingSecurity::CPPCheckAccess(${blink_receiver},1)",
++                    body=T("return;")),
++            ])
++        elif cg_context.attribute_set:
++            node = SequenceNode([
++                T("// [CPPAttributeSecurity: Write]"),
++                CxxLikelyIfNode(
++                    cond="!BindingSecurity::CPPCheckAccess(${blink_receiver},2)",
++                    body=T("return;")),
++            ])
++        node.accumulate(
++            CodeGenAccumulator.require_include_headers([
++                "third_party/blink/renderer/bindings/core/v8/binding_security.h",
++            ]))
++        return node
++    return None
++
+ def make_attribute_get_callback_def(cg_context, function_name):
+     assert isinstance(cg_context, CodeGenContext)
+     assert isinstance(function_name, str)
+@@ -1722,10 +1773,11 @@ def make_attribute_get_callback_def(cg_context, function_name):
+         make_return_value_cache_return_early(cg_context),
+         EmptyNode(),
+         make_check_security_of_return_value(cg_context),
++        make_cpp_attribute_security_check(cg_context),
+         make_v8_set_return_value(cg_context),
+         make_report_high_entropy(cg_context),
+         make_return_value_cache_update_value(cg_context),
+-    ])
++    ])  
+ 
+     return func_def
+ 
+@@ -1784,6 +1836,7 @@ EventListener* event_handler = JSEventHandler::CreateOrNull(
+         ])
+         code_generator_info = cg_context.attribute.code_generator_info
+         func_name = name_style.api_func("set", cg_context.attribute.identifier)
++        body.append(make_cpp_attribute_security_check(cg_context))
+         if code_generator_info.defined_in_partial:
+             class_name = (code_generator_info.receiver_implemented_as
+                           or name_style.class_(
+@@ -1868,6 +1921,7 @@ EventListener* event_handler = JSEventHandler::CreateOrNull(
+     body.extend([
+         make_steps_of_ce_reactions(cg_context),
+         EmptyNode(),
++        make_cpp_attribute_security_check(cg_context),
+         make_v8_set_return_value(cg_context),
+     ])
+ 
+@@ -6536,7 +6590,6 @@ def generate_interface(interface_identifier):
+ 
+     web_idl_database = package_initializer().web_idl_database()
+     interface = web_idl_database.find(interface_identifier)
+-
+     path_manager = PathManager(interface)
+     api_component = path_manager.api_component
+     impl_component = path_manager.impl_component
+@@ -6642,6 +6695,7 @@ def generate_interface(interface_identifier):
+         add_custom_callback_impl_decl(
+             name=name_style.func("LegacyCallCustom"),
+             arg_decls=["const v8::FunctionCallbackInfo<v8::Value>&"])
++
+     for attribute in interface.attributes:
+         custom_values = attribute.extended_attributes.values_of("Custom")
+         is_cross_origin = "CrossOrigin" in attribute.extended_attributes
+diff --git a/bindings/scripts/generate_bindings.py b/bindings/scripts/generate_bindings.py
+index 528d1b2f6..b7cbf60e3 100644
+--- a/bindings/scripts/generate_bindings.py
++++ b/bindings/scripts/generate_bindings.py
+@@ -60,7 +60,6 @@ def parse_options():
+ 
+ def main():
+     options, tasks = parse_options()
+-
+     dispatch_table = {
+         'callback_function': bind_gen.generate_callback_functions,
+         'callback_interface': bind_gen.generate_callback_interfaces,
+diff --git a/bindings/scripts/idl_compiler.py b/bindings/scripts/idl_compiler.py
+index b11b89eb5..47412a510 100755
+--- a/bindings/scripts/idl_compiler.py
++++ b/bindings/scripts/idl_compiler.py
+@@ -178,6 +178,7 @@ def main():
+     options, input_filename = parse_options()
+     info_provider = create_component_info_provider(options.info_dir,
+                                                    options.target_component)
++    
+     if options.generate_impl or options.read_idl_list_from_file:
+         # |input_filename| should be a file which contains a list of IDL
+         # dictionary paths.
+diff --git a/core/css/css_properties.json5 b/core/css/css_properties.json5
+index 179cc999e..b395fd38a 100644
+--- a/core/css/css_properties.json5
++++ b/core/css/css_properties.json5
+@@ -3047,6 +3047,19 @@
+       typedom_types: ["Keyword"],
+       default_value: "auto",
+     },
++    {
++      name: "policy",
++      property_methods: ["ParseSingleValue", "CSSValueFromComputedStyleInternal"],
++      inherited: true,
++      field_group: "*",
++      field_template: "external",
++      include_paths: ["third_party/blink/renderer/core/style/policy_data.h"],
++      wrapper_pointer_name: "Persistent",
++      default_value: "nullptr",
++      type_name: "PolicyData",
++      computed_style_custom_functions: ["getter", "setter"],
++      style_builder_custom_functions: ["initial", "inherit", "value"],
++    },
+     {
+       name: "position",
+       property_methods: ["CSSValueFromComputedStyleInternal"],
+diff --git a/core/css/parser/at_rule_descriptor_parser.cc b/core/css/parser/at_rule_descriptor_parser.cc
+index bb9620823..c04b755be 100644
+--- a/core/css/parser/at_rule_descriptor_parser.cc
++++ b/core/css/parser/at_rule_descriptor_parser.cc
+@@ -185,6 +185,7 @@ CSSValue* ConsumeDescriptor(StyleRule::RuleType rule_type,
+     case StyleRule::kNamespace:
+     case StyleRule::kSupports:
+     case StyleRule::kViewport:
++    case StyleRule::kPolicyRule:
+       // TODO(andruud): Handle other descriptor types here.
+       NOTREACHED();
+       return nullptr;
+diff --git a/core/css/parser/css_parser.cc b/core/css/parser/css_parser.cc
+index 1d8da20bd..55807ed35 100644
+--- a/core/css/parser/css_parser.cc
++++ b/core/css/parser/css_parser.cc
+@@ -67,6 +67,15 @@ StyleRuleBase* CSSParser::ParseRule(const CSSParserContext* context,
+                                   CSSParserImpl::kAllowImportRules);
+ }
+ 
++ParseSheetResult CSSParser::ParseCPPSheet(
++    const CSSParserContext* context,
++    StyleSheetContents* style_sheet,
++    const String& text,
++    CSSDeferPropertyParsing defer_property_parsing) {
++  return CSSParserImpl::ParseCPPSheet(
++      text, context, style_sheet, defer_property_parsing);
++}
++
+ ParseSheetResult CSSParser::ParseSheet(
+     const CSSParserContext* context,
+     StyleSheetContents* style_sheet,
+diff --git a/core/css/parser/css_parser.h b/core/css/parser/css_parser.h
+index a8b10cb43..9c7436243 100644
+--- a/core/css/parser/css_parser.h
++++ b/core/css/parser/css_parser.h
+@@ -37,6 +37,12 @@ class CORE_EXPORT CSSParser {
+                                   StyleSheetContents*,
+                                   const String&);
+ 
++  static ParseSheetResult ParseCPPSheet(
++      const CSSParserContext*,
++      StyleSheetContents*,
++      const String&,
++      CSSDeferPropertyParsing defer_property_parsing =
++          CSSDeferPropertyParsing::kNo);
+   static ParseSheetResult ParseSheet(
+       const CSSParserContext*,
+       StyleSheetContents*,
+diff --git a/core/css/parser/css_parser_impl.cc b/core/css/parser/css_parser_impl.cc
+index a8ab5e65a..dab52362c 100644
+--- a/core/css/parser/css_parser_impl.cc
++++ b/core/css/parser/css_parser_impl.cc
+@@ -5,6 +5,8 @@
+ #include "third_party/blink/renderer/core/css/parser/css_parser_impl.h"
+ 
+ #include <bitset>
++#include <iostream>
++#include <stdio.h>
+ #include <memory>
+ #include <utility>
+ 
+@@ -246,6 +248,38 @@ StyleRuleBase* CSSParserImpl::ParseRule(const String& string,
+   return rule;
+ }
+ 
++ParseSheetResult CSSParserImpl::ParseCPPSheet(
++    const String& string,
++    const CSSParserContext* context,
++    StyleSheetContents* style_sheet,
++    CSSDeferPropertyParsing defer_property_parsing) {
++  TRACE_EVENT_BEGIN2("blink,blink_style", "CSSParserImpl::parseCPPSheet",
++                     "baseUrl", context->BaseURL().GetString().Utf8(), "mode",
++                     context->Mode());
++
++  TRACE_EVENT_BEGIN0("blink,blink_style", "CSSParserImpl::parseCPPSheet.parse");
++  CSSTokenizer tokenizer(string);
++  CSSParserTokenStream stream(tokenizer);
++  CSSParserImpl parser(context, style_sheet);
++  if (defer_property_parsing == CSSDeferPropertyParsing::kYes) {
++    parser.lazy_state_ = MakeGarbageCollected<CSSLazyParsingState>(
++        context, string, parser.style_sheet_);
++  }
++  ParseSheetResult result = ParseSheetResult::kSucceeded;
++  bool first_rule_valid = parser.ConsumeRuleList(
++      stream, kPolicyRuleList,
++      [&style_sheet](StyleRuleBase* rule) {
++        style_sheet->ParserAppendRule(rule);
++      });
++  style_sheet->SetHasSyntacticallyValidCSSHeader(first_rule_valid);
++  TRACE_EVENT_END0("blink,blink_style", "CSSParserImpl::parseCPPSheet.parse");
++
++  TRACE_EVENT_END2("blink,blink_style", "CSSParserImpl::parseCPPSheet",
++                   "tokenCount", tokenizer.TokenCount(), "length",
++                   string.length());
++  return result;
++}
++
+ ParseSheetResult CSSParserImpl::ParseStyleSheet(
+     const String& string,
+     const CSSParserContext* context,
+@@ -434,6 +468,9 @@ bool CSSParserImpl::ConsumeRuleList(CSSParserTokenStream& stream,
+     case kFontFeatureRuleList:
+       allowed_rules = kFontFeatureRules;
+       break;
++    case kPolicyRuleList:
++      allowed_rules = kPolicyRules;
++      break;
+     default:
+       NOTREACHED();
+   }
+@@ -465,11 +502,11 @@ bool CSSParserImpl::ConsumeRuleList(CSSParserTokenStream& stream,
+       first_rule_valid = rule;
+     }
+     if (rule) {
+-      allowed_rules = ComputeNewAllowedRules(allowed_rules, rule);
++      if (allowed_rules != kPolicyRules)
++        allowed_rules = ComputeNewAllowedRules(allowed_rules, rule);
+       callback(rule);
+     }
+   }
+-
+   return first_rule_valid;
+ }
+ 
+@@ -573,6 +610,10 @@ StyleRuleBase* CSSParserImpl::ConsumeAtRule(CSSParserTokenStream& stream,
+ StyleRuleBase* CSSParserImpl::ConsumeQualifiedRule(
+     CSSParserTokenStream& stream,
+     AllowedRulesType allowed_rules) {
++
++  if (allowed_rules == kPolicyRules) {
++    return ConsumePolicyRule(stream);
++  }
+   if (allowed_rules <= kRegularRules) {
+     return ConsumeStyleRule(stream);
+   }
+@@ -1021,6 +1062,50 @@ StyleRule* CSSParserImpl::ConsumeStyleRule(CSSParserTokenStream& stream) {
+       CreateCSSPropertyValueSet(parsed_properties_, context_->Mode()));
+ }
+ 
++
++StyleRule* CSSParserImpl::ConsumePolicyRule(CSSParserTokenStream& stream) {
++  if (observer_)
++    observer_->StartRuleHeader(StyleRule::kPolicyRule, stream.LookAheadOffset());
++
++  // Parse the prelude of the style rule
++  CSSSelectorList selector_list = CSSSelectorParser::ConsumeSelector(
++      stream, context_, style_sheet_, observer_);
++
++  if (!selector_list.IsValid()) {
++    // Read the rest of the prelude if there was an error
++    stream.EnsureLookAhead();
++    while (!stream.UncheckedAtEnd() &&
++           stream.UncheckedPeek().GetType() != kLeftBraceToken)
++      stream.UncheckedConsumeComponentValue();
++  }
++
++  if (observer_)
++    observer_->EndRuleHeader(stream.LookAheadOffset());
++
++  if (stream.AtEnd())
++    return nullptr;  // Parse error, EOF instead of qualified rule block
++
++  DCHECK_EQ(stream.Peek().GetType(), kLeftBraceToken);
++  CSSParserTokenStream::BlockGuard guard(stream);
++
++  if (!selector_list.IsValid())
++    return nullptr;  // Parse error, invalid selector list
++
++  // TODO(csharrison): How should we lazily parse css that needs the observer?
++  if (!observer_ && lazy_state_) {
++    DCHECK(style_sheet_);
++    return MakeGarbageCollected<StyleRule>(
++        std::move(selector_list),
++        MakeGarbageCollected<CSSLazyPropertyParserImpl>(stream.Offset() - 1,
++                                                        lazy_state_));
++  }
++  ConsumeDeclarationList(stream, StyleRule::kPolicyRule);
++
++  return MakeGarbageCollected<StyleRule>(
++      std::move(selector_list),
++      CreateCSSPropertyValueSet(parsed_properties_, context_->Mode()));
++}
++
+ void CSSParserImpl::ConsumeDeclarationList(CSSParserTokenStream& stream,
+                                            StyleRule::RuleType rule_type) {
+   DCHECK(parsed_properties_.IsEmpty());
+@@ -1028,7 +1113,8 @@ void CSSParserImpl::ConsumeDeclarationList(CSSParserTokenStream& stream,
+   bool use_observer = observer_ && (rule_type == StyleRule::kStyle ||
+                                     rule_type == StyleRule::kProperty ||
+                                     rule_type == StyleRule::kScrollTimeline ||
+-                                    rule_type == StyleRule::kKeyframe);
++                                    rule_type == StyleRule::kKeyframe ||
++                                    rule_type == StyleRule::kPolicyRule);
+   if (use_observer) {
+     observer_->StartRuleBody(stream.Offset());
+   }
+@@ -1128,6 +1214,12 @@ void CSSParserImpl::ConsumeDeclaration(CSSParserTokenStream& stream,
+     ConsumeVariableValue(tokenized_value.range, variable_name, important,
+                          is_animation_tainted);
+   } else if (unresolved_property != CSSPropertyID::kInvalid) {
++    
++    //CPP Isolation
++    if (unresolved_property == CSSPropertyID::kPolicy ^ 
++        rule_type == StyleRule::kPolicyRule){
++      return;
++    }
+     if (style_sheet_ && style_sheet_->SingleOwnerDocument())
+       Deprecation::WarnOnDeprecatedProperties(
+           style_sheet_->SingleOwnerDocument()->GetFrame(), unresolved_property);
+diff --git a/core/css/parser/css_parser_impl.h b/core/css/parser/css_parser_impl.h
+index 801321019..327e7cb0b 100644
+--- a/core/css/parser/css_parser_impl.h
++++ b/core/css/parser/css_parser_impl.h
+@@ -65,6 +65,7 @@ class CORE_EXPORT CSSParserImpl {
+     kRegularRules,
+     kKeyframeRules,
+     kFontFeatureRules,
++    kPolicyRules,
+     kNoRules,  // For parsing at-rules inside declaration lists
+   };
+ 
+@@ -106,6 +107,12 @@ class CORE_EXPORT CSSParserImpl {
+                                   const CSSParserContext*,
+                                   StyleSheetContents*,
+                                   AllowedRulesType);
++  static ParseSheetResult ParseCPPSheet(
++      const String&,
++      const CSSParserContext*,
++      StyleSheetContents*,
++      CSSDeferPropertyParsing = CSSDeferPropertyParsing::kNo);
++
+   static ParseSheetResult ParseStyleSheet(
+       const String&,
+       const CSSParserContext*,
+@@ -143,6 +150,7 @@ class CORE_EXPORT CSSParserImpl {
+     kRegularRuleList,
+     kKeyframesRuleList,
+     kFontFeatureRuleList,
++    kPolicyRuleList,
+   };
+ 
+   // Returns whether the first encountered rule was valid
+@@ -171,6 +179,7 @@ class CORE_EXPORT CSSParserImpl {
+                                               const RangeOffset& prelude_offset,
+                                               CSSParserTokenStream& block);
+   StyleRule* ConsumeStyleRule(CSSParserTokenStream&);
++  StyleRule* ConsumePolicyRule(CSSParserTokenStream&);
+ 
+   void ConsumeDeclarationList(CSSParserTokenStream&, StyleRule::RuleType);
+   void ConsumeDeclaration(CSSParserTokenStream&, StyleRule::RuleType);
+diff --git a/core/css/properties/computed_style_utils.cc b/core/css/properties/computed_style_utils.cc
+index 8562602f8..7a3a4619b 100644
+--- a/core/css/properties/computed_style_utils.cc
++++ b/core/css/properties/computed_style_utils.cc
+@@ -2097,6 +2097,16 @@ CSSValue* ComputedStyleUtils::ValueForContentData(const ComputedStyle& style,
+   return outer_list;
+ }
+ 
++CSSValue* ComputedStyleUtils::ValueForPolicyData(const ComputedStyle& style) {
++  const PolicyData* policy_data = style.GetPolicyData();
++  if(policy_data){
++    String policy_string = policy_data->GetText();
++    if(policy_string)
++      return MakeGarbageCollected<CSSStringValue>(policy_string);
++  }
++  return CSSIdentifierValue::Create(CSSValueID::kNormal);
++}
++
+ CSSValue* ComputedStyleUtils::ValueForCounterDirectives(
+     const ComputedStyle& style,
+     CounterNode::Type type) {
+diff --git a/core/css/properties/computed_style_utils.h b/core/css/properties/computed_style_utils.h
+index aa7e69c4b..453f659de 100644
+--- a/core/css/properties/computed_style_utils.h
++++ b/core/css/properties/computed_style_utils.h
+@@ -185,6 +185,7 @@ class CORE_EXPORT ComputedStyleUtils {
+   static CSSValue* ValueForTransitionProperty(const CSSTransitionData*);
+   static CSSValue* ValueForContentData(const ComputedStyle&,
+                                        bool allow_visited_style);
++  static CSSValue* ValueForPolicyData(const ComputedStyle&);
+ 
+   static CSSValue* ValueForCounterDirectives(const ComputedStyle&,
+                                              CounterNode::Type type);
+diff --git a/core/css/properties/css_parsing_utils.cc b/core/css/properties/css_parsing_utils.cc
+index a72cce675..4336a997d 100644
+--- a/core/css/properties/css_parsing_utils.cc
++++ b/core/css/properties/css_parsing_utils.cc
+@@ -2425,7 +2425,6 @@ const CSSValue* ParseLonghand(CSSPropertyID unresolved_property,
+       CSSParserLocalContext()
+           .WithAliasParsing(isPropertyAlias(unresolved_property))
+           .WithCurrentShorthand(current_shorthand);
+-
+   const CSSValue* result = To<Longhand>(CSSProperty::Get(property_id))
+                                .ParseSingleValue(range, context, local_context);
+   return result;
+diff --git a/core/css/properties/css_property.cc b/core/css/properties/css_property.cc
+index af17d6cc3..62ae99dce 100644
+--- a/core/css/properties/css_property.cc
++++ b/core/css/properties/css_property.cc
+@@ -48,6 +48,7 @@ const CSSValue* CSSProperty::CSSValueFromComputedStyle(
+   const SVGComputedStyle& svg_style = style.SvgStyle();
+   const CSSProperty& resolved_property =
+       ResolveDirectionAwareProperty(style.Direction(), style.GetWritingMode());
++      
+   return resolved_property.CSSValueFromComputedStyleInternal(
+       style, svg_style, layout_object, allow_visited_style);
+ }
+diff --git a/core/css/properties/longhands/longhands_custom.cc b/core/css/properties/longhands/longhands_custom.cc
+index d7bd5bfcf..11a44dd87 100644
+--- a/core/css/properties/longhands/longhands_custom.cc
++++ b/core/css/properties/longhands/longhands_custom.cc
+@@ -59,6 +59,7 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
++#include <iostream>
+ // Implementations of methods in Longhand subclasses that aren't generated.
+ 
+ namespace blink {
+@@ -2123,6 +2124,116 @@ void Content::ApplyValue(StyleResolverState& state,
+   state.Style()->SetContent(first_content);
+ }
+ 
++
++const CSSValue* Policy::ParseSingleValue(CSSParserTokenRange& range,
++                                          const CSSParserContext& context,
++                                          const CSSParserLocalContext&) const {
++
++  if (css_parsing_utils::IdentMatches<CSSValueID::kNone, CSSValueID::kNormal>(
++          range.Peek().Id())){
++    return css_parsing_utils::ConsumeIdent(range);
++  }
++  const CSSParserToken* first = range.begin();
++  const CSSParserToken* last = range.end()-1;
++  while (last >= first && last->GetType() == kWhitespaceToken)
++    --last;
++  while (last >= first && first->GetType() == kWhitespaceToken)
++    ++first;
++  if(first->GetType()== kLeftBraceToken&&last->GetType()== kRightBraceToken){
++    range=range.MakeSubRange(first+1,last);
++  }
++  else{
++    return nullptr;
++  }
++  CSSValueList* values = CSSValueList::CreateSpaceSeparated();
++  do {
++    CSSValue* parsed_value = nullptr;
++    if (!parsed_value){
++      parsed_value = css_parsing_utils::ConsumeString(range);
++      if(parsed_value){
++        values->Append(*parsed_value);
++        if (range.Peek().GetType() == kColonToken) {
++          range.ConsumeIncludingWhitespace();
++        }
++        else{
++          return values;
++        }
++        parsed_value = css_parsing_utils::ConsumeString(range);
++        if(parsed_value){
++          values->Append(*parsed_value);
++        }
++        else{
++          return nullptr;
++        }
++      }
++    }
++    if (!parsed_value) {
++      if (css_parsing_utils::ConsumeCommaIncludingWhitespace(range)) {
++        // No values were parsed before the slash, so nothing to apply the
++        // alternative text to.
++        if (!values->length())
++          return nullptr;
++        // alt_text_present = true;
++      } else {
++        return nullptr;
++      }
++    }
++  } while (!range.AtEnd());
++  return values;
++}
++
++const CSSValue* Policy::CSSValueFromComputedStyleInternal(
++    const ComputedStyle& style,
++    const SVGComputedStyle&,
++    const LayoutObject*,
++    bool allow_visited_style) const {
++  return ComputedStyleUtils::ValueForPolicyData(style);
++}
++
++void Policy::ApplyInitial(StyleResolverState& state) const {
++  state.Style()->SetPolicy(nullptr);
++}
++
++void Policy::ApplyInherit(StyleResolverState& state) const {
++  state.Style()->SetPolicy(state.ParentStyle()->GetPolicyData());
++}
++
++void Policy::ApplyValue(StyleResolverState& state,
++                         const CSSValue& value) const {
++  const CSSValueList& values = To<CSSValueList>(value);
++  PolicyData* first_policy = nullptr;
++  String policy_url;
++  bool url_flag=0;
++  for (auto& item : values) {
++    PolicyData* next_policy = nullptr;
++    String temp;
++    temp = To<CSSStringValue>(*item).Value();
++    if(url_flag){
++      uint8_t policy_value=0;
++      if (temp=="R") policy_value=1;
++      else if (temp=="W") policy_value=2;
++      else if (temp=="RW"||temp=="WR") policy_value=3; 
++      first_policy->AddPolicy(policy_url,policy_value);
++      url_flag=0;
++    }
++    else{
++      policy_url=temp;
++      url_flag=1;
++      if (first_policy) {
++        first_policy->SetText(first_policy->GetText() + temp);
++        continue;
++      } 
++      else {
++        next_policy = MakeGarbageCollected<PolicyData>(temp);
++        first_policy = next_policy;
++      }
++    }
++  }
++  DCHECK(first_policy);
++  PolicyData::PolicyMap hashmap=first_policy->GetPolicyMap();
++  state.Style()->SetPolicy(first_policy);
++}
++
+ const int kCounterIncrementDefaultValue = 1;
+ 
+ const CSSValue* CounterIncrement::ParseSingleValue(
+diff --git a/core/css/properties/policy.cpp b/core/css/properties/policy.cpp
+new file mode 100644
+index 000000000..f42840e91
+--- /dev/null
++++ b/core/css/properties/policy.cpp
+@@ -0,0 +1,86 @@
++#include "core/css/properties/longhands/policy.h"
++
++#include "core/css/parser/CSSParserContext.h"
++#include "third_party/blink/renderer/core/css/properties/css_parsing_utils.h"
++#include "third_party/blink/renderer/core/css/css_value_list.h"
++#include "third_party/blink/renderer/core/css_value_keywords.h"
++
++namespace blink {
++
++
++const CSSValue* Policy::ParseSingleValue(CSSParserTokenRange& range,
++                                          const CSSParserContext& context,
++                                          const CSSParserLocalContext&) const {
++  if (css_parsing_utils::IdentMatches<CSSValueID::kNone, CSSValueID::kNormal>(
++          range.Peek().Id()))
++    return css_parsing_utils::ConsumeIdent(range);
++
++  CSSValueList* values = CSSValueList::CreateSpaceSeparated();
++  CSSValueList* outer_list = CSSValueList::CreateSlashSeparated();
++  bool alt_text_present = false;
++  do {
++    CSSValue* parsed_value = css_parsing_utils::ConsumeImage(range, context);
++    if (!parsed_value) {
++      parsed_value = css_parsing_utils::ConsumeIdent<
++          CSSValueID::kOpenQuote, CSSValueID::kCloseQuote,
++          CSSValueID::kNoOpenQuote, CSSValueID::kNoCloseQuote>(range);
++    }
++    if (!parsed_value)
++      parsed_value = css_parsing_utils::ConsumeString(range);
++    if (!parsed_value) {
++      if (range.Peek().FunctionId() == CSSValueID::kAttr) {
++        parsed_value =
++            ConsumeAttr(css_parsing_utils::ConsumeFunction(range), context);
++      } else if (range.Peek().FunctionId() == CSSValueID::kCounter) {
++        parsed_value = ConsumeCounterContent(
++            css_parsing_utils::ConsumeFunction(range), context, false);
++      } else if (range.Peek().FunctionId() == CSSValueID::kCounters) {
++        parsed_value = ConsumeCounterContent(
++            css_parsing_utils::ConsumeFunction(range), context, true);
++      }
++    }
++    if (!parsed_value) {
++      if (css_parsing_utils::ConsumeSlashIncludingWhitespace(range)) {
++        // No values were parsed before the slash, so nothing to apply the
++        // alternative text to.
++        if (!values->length())
++          return nullptr;
++        alt_text_present = true;
++      } else {
++        return nullptr;
++      }
++    } else {
++      values->Append(*parsed_value);
++    }
++  } while (!range.AtEnd() && !alt_text_present);
++  outer_list->Append(*values);
++  if (alt_text_present) {
++    CSSStringValue* alt_text = css_parsing_utils::ConsumeString(range);
++    if (!alt_text)
++      return nullptr;
++    outer_list->Append(*alt_text);
++  }
++  return outer_list;
++}
++
++const CSSValue* Policy::CSSValueFromComputedStyleInternal(
++    const ComputedStyle& style,
++    const SVGComputedStyle&,
++    const LayoutObject*,
++    bool allow_visited_style) const {
++  return ComputedStyleUtils::ValueForContentData(style, allow_visited_style);
++}
++
++void Policy::ApplyInitial(StyleResolverState& state) const {
++  state.Style()->SetContent(nullptr);
++}
++
++void Policy::ApplyInherit(StyleResolverState& state) const {
++}
++
++void Policy::ApplyValue(StyleResolverState& state,
++                         const CSSValue& value) const {
++}
++
++
++}  // namespace blink
+\ No newline at end of file
+diff --git a/core/css/resolver/style_builder.cc b/core/css/resolver/style_builder.cc
+index 398261136..41e394569 100644
+--- a/core/css/resolver/style_builder.cc
++++ b/core/css/resolver/style_builder.cc
+@@ -69,6 +69,7 @@ void StyleBuilder::ApplyProperty(const CSSProperty& property,
+       << "Please use a CustomProperty instance to apply custom properties";
+ 
+   CSSPropertyID id = property.PropertyID();
++
+   bool is_inherited = property.IsInherited();
+   const CSSValue& value = scoped_value.GetCSSValue();
+ 
+diff --git a/core/css/resolver/style_cascade.cc b/core/css/resolver/style_cascade.cc
+index 13ce88a07..5feb47887 100644
+--- a/core/css/resolver/style_cascade.cc
++++ b/core/css/resolver/style_cascade.cc
+@@ -401,6 +401,7 @@ void StyleCascade::ApplyMatchResult(CascadeResolver& resolver) {
+       auto priority = CascadePriority(e.Priority(), resolver.generation_);
+       const CSSProperty& property = ResolveSurrogate(e.Property());
+       CascadePriority* p = map_.Find(property.GetCSSPropertyName());
++
+       if (!p || *p >= priority)
+         continue;
+       *p = priority;
+@@ -543,6 +544,7 @@ void StyleCascade::LookupAndApplyDeclaration(const CSSProperty& property,
+   const TreeScope* tree_scope{nullptr};
+   if (origin == CascadeOrigin::kAuthor)
+     tree_scope = &TreeScopeAt(match_result_, priority.GetPosition());
++
+   StyleBuilder::ApplyProperty(property, state_,
+                               ScopedCSSValue(*value, tree_scope));
+ }
+diff --git a/core/css/style_engine.cc b/core/css/style_engine.cc
+index 127c6dc4a..90334b08a 100644
+--- a/core/css/style_engine.cc
++++ b/core/css/style_engine.cc
+@@ -826,7 +826,7 @@ CSSStyleSheet* StyleEngine::CreateSheet(Element& element,
+ 
+   auto result = text_to_sheet_cache_.insert(text_content, nullptr);
+   StyleSheetContents* contents = result.stored_value->value;
+-  if (result.is_new_entry || !contents ||
++  if (result.is_new_entry || !contents ||    //new style sheet
+       !contents->IsCacheableForStyleElement()) {
+     result.stored_value->value = nullptr;
+     style_sheet = ParseSheet(element, text, start_position);
+@@ -860,7 +860,11 @@ CSSStyleSheet* StyleEngine::ParseSheet(Element& element,
+   CSSStyleSheet* style_sheet = nullptr;
+   style_sheet = CSSStyleSheet::CreateInline(element, NullURL(), start_position,
+                                             GetDocument().Encoding());
+-  style_sheet->Contents()->ParseStringAtPosition(text, start_position);
++  if(element.IsCPPPolicyElement()){
++    style_sheet->Contents()->ParseStringAtPositionForCPP(text, start_position);
++  }
++  else                                           
++    style_sheet->Contents()->ParseStringAtPosition(text, start_position);
+   return style_sheet;
+ }
+ 
+diff --git a/core/css/style_rule.cc b/core/css/style_rule.cc
+index 44850befa..e9cf6e7f1 100644
+--- a/core/css/style_rule.cc
++++ b/core/css/style_rule.cc
+@@ -96,6 +96,9 @@ void StyleRuleBase::Trace(Visitor* visitor) const {
+     case kViewport:
+       To<StyleRuleViewport>(this)->TraceAfterDispatch(visitor);
+       return;
++    case kPolicyRule:
++      To<StyleRule>(this)->TraceAfterDispatch(visitor);
++      return;
+   }
+   NOTREACHED();
+ }
+@@ -141,6 +144,9 @@ void StyleRuleBase::FinalizeGarbageCollectedObject() {
+     case kViewport:
+       To<StyleRuleViewport>(this)->~StyleRuleViewport();
+       return;
++    case kPolicyRule:
++      To<StyleRule>(this)->~StyleRule();
++      return;
+   }
+   NOTREACHED();
+ }
+@@ -175,6 +181,8 @@ StyleRuleBase* StyleRuleBase::Copy() const {
+     case kKeyframe:
+       NOTREACHED();
+       return nullptr;
++    case kPolicyRule:
++      return To<StyleRule>(this)->Copy();
+   }
+   NOTREACHED();
+   return nullptr;
+@@ -225,6 +233,10 @@ CSSRule* StyleRuleBase::CreateCSSOMWrapper(CSSStyleSheet* parent_sheet,
+       rule = MakeGarbageCollected<CSSNamespaceRule>(
+           To<StyleRuleNamespace>(self), parent_sheet);
+       break;
++    case kPolicyRule:
++      rule =
++          MakeGarbageCollected<CSSStyleRule>(To<StyleRule>(self), parent_sheet);
++      break;
+     case kKeyframe:
+     case kCharset:
+     case kViewport:
+diff --git a/core/css/style_rule.h b/core/css/style_rule.h
+index f8f0570c4..a36545963 100644
+--- a/core/css/style_rule.h
++++ b/core/css/style_rule.h
+@@ -51,6 +51,7 @@ class CORE_EXPORT StyleRuleBase : public GarbageCollected<StyleRuleBase> {
+     kScrollTimeline,
+     kSupports,
+     kViewport,
++    kPolicyRule,
+   };
+ 
+   RuleType GetType() const { return static_cast<RuleType>(type_); }
+diff --git a/core/css/style_sheet_contents.cc b/core/css/style_sheet_contents.cc
+index 63b37b756..a90952ad1 100644
+--- a/core/css/style_sheet_contents.cc
++++ b/core/css/style_sheet_contents.cc
+@@ -35,6 +35,7 @@
+ #include "third_party/blink/renderer/platform/instrumentation/tracing/trace_event.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ 
++#include <iostream>
+ namespace blink {
+ 
+ // static
+@@ -323,7 +324,6 @@ void StyleSheetContents::ParseAuthorStyleSheet(
+   TRACE_EVENT1(
+       "blink,devtools.timeline", "ParseAuthorStyleSheet", "data",
+       inspector_parse_author_style_sheet_event::Data(cached_style_sheet));
+-
+   const ResourceResponse& response = cached_style_sheet->GetResponse();
+   CSSStyleSheetResource::MIMETypeCheck mime_type_check =
+       (IsQuirksModeBehavior(parser_context_->Mode()) &&
+@@ -362,6 +362,15 @@ ParseSheetResult StyleSheetContents::ParseStringAtPosition(
+                                allow_import_rules);
+ }
+ 
++ParseSheetResult StyleSheetContents::ParseStringAtPositionForCPP(
++    const String& sheet_text,
++    const TextPosition& start_position) {
++  const auto* context =
++      MakeGarbageCollected<CSSParserContext>(ParserContext(), this);
++  return CSSParser::ParseCPPSheet(context, this, sheet_text,
++                               CSSDeferPropertyParsing::kNo);
++}
++
+ bool StyleSheetContents::IsLoading() const {
+   for (unsigned i = 0; i < import_rules_.size(); ++i) {
+     if (import_rules_[i]->IsLoading())
+@@ -481,6 +490,7 @@ static bool ChildRulesHaveFailedOrCanceledSubresources(
+     const StyleRuleBase* rule = rules[i].Get();
+     switch (rule->GetType()) {
+       case StyleRuleBase::kStyle:
++      case StyleRuleBase::kPolicyRule:
+         if (To<StyleRule>(rule)->PropertiesHaveFailedOrCanceledSubresources())
+           return true;
+         break;
+diff --git a/core/css/style_sheet_contents.h b/core/css/style_sheet_contents.h
+index 6cf8a20e2..6dbd7d76b 100644
+--- a/core/css/style_sheet_contents.h
++++ b/core/css/style_sheet_contents.h
+@@ -70,6 +70,8 @@ class CORE_EXPORT StyleSheetContents final
+   ParseSheetResult ParseStringAtPosition(const String&,
+                                          const TextPosition&,
+                                          bool allow_import_rules = true);
++  ParseSheetResult ParseStringAtPositionForCPP(const String&,
++                                               const TextPosition&);
+ 
+   bool IsCacheableForResource() const;
+   bool IsCacheableForStyleElement() const;
+diff --git a/core/dom/build.gni b/core/dom/build.gni
+index cfee19724..0a8240ded 100644
+--- a/core/dom/build.gni
++++ b/core/dom/build.gni
+@@ -78,6 +78,8 @@ blink_core_sources_dom = [
+   "document_encoding_data.h",
+   "document_fragment.cc",
+   "document_fragment.h",
++  "document_info_manager.cc",
++  "document_info_manager.h",
+   "document_init.cc",
+   "document_init.h",
+   "document_lifecycle.cc",
+diff --git a/core/dom/container_node.cc b/core/dom/container_node.cc
+index d336d0ce4..59990500d 100644
+--- a/core/dom/container_node.cc
++++ b/core/dom/container_node.cc
+@@ -63,6 +63,8 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
++
+ namespace blink {
+ 
+ static void DispatchChildInsertionEvents(Node&);
+@@ -829,6 +831,9 @@ void ContainerNode::RemoveChildren(SubtreeModificationAction action) {
+       ScriptForbiddenScope forbid_script;
+ 
+       while (Node* child = first_child_) {
++        if (!BindingSecurity::CPPCheckAccess(child,2)){
++          return;
++        }
+         RemoveBetween(nullptr, child->nextSibling(), *child);
+         NotifyNodeRemoved(*child);
+         if (removed_nodes)
+diff --git a/core/dom/create_element_flags.h b/core/dom/create_element_flags.h
+index dcabf7adf..48e52f029 100644
+--- a/core/dom/create_element_flags.h
++++ b/core/dom/create_element_flags.h
+@@ -16,6 +16,8 @@ class CreateElementFlags {
+ 
+  public:
+   bool IsCreatedByParser() const { return created_by_parser_; }
++  bool IsCreatedDuringWrite() const { return created_during_document_write_; }
++
+   Document* ParserDocument() const { return parser_document_; }
+   bool IsAsyncCustomElements() const { return async_custom_elements_; }
+   bool IsCustomElementsV1() const { return custom_elements_v1_; }
+@@ -54,7 +56,15 @@ class CreateElementFlags {
+         async_custom_elements_(false),
+         custom_elements_v1_(true),
+         custom_elements_v0_(true),
+-        already_started_(false) {}
++        already_started_(false),
++        created_during_document_write_(false) {}
++
++  CreateElementFlags& SetCreatedDuringWrite(bool flag) {
++    DCHECK(flag);
++    created_during_document_write_ = flag;
++    // parser_document_ = document;
++    return *this;
++  }
+ 
+   CreateElementFlags& SetCreatedByParser(bool flag, Document* document) {
+     DCHECK(flag || !document);
+@@ -103,8 +113,9 @@ class CreateElementFlags {
+   bool async_custom_elements_ : 1;
+   bool custom_elements_v1_ : 1;
+   bool custom_elements_v0_ : 1;
+-
+   bool already_started_ : 1;
++  bool created_during_document_write_ : 1;
++
+ };
+ 
+ }  // namespace blink
+diff --git a/core/dom/document.cc b/core/dom/document.cc
+index d233da316..efde0b5d7 100644
+--- a/core/dom/document.cc
++++ b/core/dom/document.cc
+@@ -337,6 +337,10 @@
+ #include "third_party/blink/renderer/platform/wtf/text/string_buffer.h"
+ #include "third_party/blink/renderer/platform/wtf/text/text_encoding_registry.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ #ifndef NDEBUG
+ using WeakDocumentSet = blink::HeapHashSet<blink::WeakMember<blink::Document>>;
+ static WeakDocumentSet& liveDocumentSet();
+@@ -801,6 +805,13 @@ Document::Document(const DocumentInit& initializer,
+               ? kAllowDeferredParsing
+               : kAllowAsynchronousParsing),
+       node_count_(0),
++      unique_node_count_(0),
++      record_access_count_(0),
++      allowed_access_count_(0),
++      denied_access_count_(0),
++      access_count_(0),
++      inserted_script_count_(0),
++      // is_navi_apis_disabled(true),
+       logged_field_edit_(false),
+       // Use the source id from the document initializer if it is available.
+       // Otherwise, generate a new source id to cover any cases that don't
+@@ -846,6 +857,8 @@ Document::Document(const DocumentInit& initializer,
+       fetcher_->SetShouldLogRequestAsInvalidInImportedDocument();
+     }
+   }
++
++  generationFlag_ = BindingSecurity::IsGenerationModeEnabled();
+   DCHECK(fetcher_);
+ 
+   root_scroller_controller_ =
+@@ -908,6 +921,10 @@ Document::~Document() {
+   DCHECK(!ax_object_cache_);
+ 
+   InstanceCounters::DecrementCounter(InstanceCounters::kDocumentCounter);
++  if (access_log_) {
++    fclose(access_log_);
++  }
++
+ }
+ 
+ Range* Document::CreateRangeAdjustedToTreeScope(const TreeScope& tree_scope,
+@@ -1043,6 +1060,9 @@ AtomicString Document::ConvertLocalName(const AtomicString& name) {
+ Element* Document::CreateRawElement(const QualifiedName& qname,
+                                     CreateElementFlags flags) {
+   Element* element = nullptr;
++  if (IsInDocumentWrite()&&qname.LocalName()=="cpp"){
++    flags.SetCreatedByParser(false,nullptr);
++  }
+   if (qname.NamespaceURI() == html_names::xhtmlNamespaceURI) {
+     // https://html.spec.whatwg.org/C/#elements-in-the-dom:element-interface
+     element = HTMLElementFactory::Create(qname.LocalName(), *this, flags);
+@@ -1102,8 +1122,9 @@ Element* Document::CreateElementForBinding(const AtomicString& name,
+           CreateElementFlags::ByCreateElement());
+     }
+     if (auto* element = HTMLElementFactory::Create(
+-            local_name, *this, CreateElementFlags::ByCreateElement()))
++            local_name, *this, CreateElementFlags::ByCreateElement())){
+       return element;
++    }
+     QualifiedName q_name(g_null_atom, local_name,
+                          html_names::xhtmlNamespaceURI);
+     if (RegistrationContext() && V0CustomElement::IsValidName(local_name))
+@@ -1560,6 +1581,9 @@ String Document::readyState() const {
+     case kInteractive:
+       return interactive;
+     case kComplete:
++      FILE* fp=fopen("./Num","a+");
++      fprintf(fp,"Loaded Url: %s ; Access Num: %d , ThirdParty Access Num: %d , Allowed Access Num: %d , Denied Access Num: %d\n",BaseURL().GetString().Utf8().c_str(),access_count_, record_access_count_, allowed_access_count_, denied_access_count_);
++      fclose(fp);
+       return complete;
+   }
+ 
+@@ -1985,6 +2009,14 @@ Page* Document::GetPage() const {
+   return GetFrame() ? GetFrame()->GetPage() : nullptr;
+ }
+ 
++void Document::setPageNavigationFlag(bool value){
++  GetPage()->SetPageNavigationFlag(value);
++}
++
++bool Document::getPageNavigationFlag() const{
++  return GetPage()->PageNavigationFlag();
++}
++
+ LocalFrame* Document::GetFrameOfTreeRootDocument() const {
+   if (GetFrame())
+     return GetFrame();
+@@ -3091,7 +3123,11 @@ void Document::Shutdown() {
+   CHECK(!GetFrame() || GetFrame()->Tree().ChildCount() == 0);
+   if (!IsActive())
+     return;
+-
++  if (IsHTMLDocument()&& execution_context_ && dom_window_){
++    FILE* fp=fopen("./Num","a+");
++    fprintf(fp,"Close Url: %s ; Access Num: %d , ThirdParty Access Num: %d , Allowed Access Num: %d , Denied Access Num: %d\n",BaseURL().GetString().Utf8().c_str(), access_count_, record_access_count_, allowed_access_count_, denied_access_count_);
++    fclose(fp);
++  }
+   // An active Document must have an associated window.
+   CHECK(dom_window_);
+ 
+@@ -3257,7 +3293,6 @@ void Document::Shutdown() {
+   // explicit in each of the callers of Document::detachLayoutTree().
+   dom_window_ = nullptr;
+   execution_context_ = nullptr;
+-
+   document_outlive_time_reporter_ =
+       std::make_unique<DocumentOutliveTimeReporter>(this);
+ }
+diff --git a/core/dom/document.h b/core/dom/document.h
+index 06141f7cc..5ce79d301 100644
+--- a/core/dom/document.h
++++ b/core/dom/document.h
+@@ -77,6 +77,8 @@
+ #include "third_party/blink/renderer/platform/wtf/casting.h"
+ #include "third_party/blink/renderer/platform/wtf/hash_set.h"
+ 
++#include "third_party/blink/renderer/core/dom/document_info_manager.h"
++
+ namespace base {
+ class SingleThreadTaskRunner;
+ }
+@@ -1423,12 +1425,50 @@ class CORE_EXPORT Document : public ContainerNode,
+   static void SetThreadedParsingEnabledForTesting(bool);
+   static bool ThreadedParsingEnabledForTesting();
+ 
+-  void IncrementNodeCount() { node_count_++; }
++  void IncrementNodeCount() { node_count_++; unique_node_count_++;}
+   void DecrementNodeCount() {
+     DCHECK_GT(node_count_, 0);
+     node_count_--;
+   }
+   int NodeCount() const { return node_count_; }
++  int UniqueNodeCount() const { return unique_node_count_; }
++
++  int ThirdpartyAccessCount() { return record_access_count_++; }
++  int AllowedAccessCount() { return allowed_access_count_++; }
++  int DeniedAccessCount() { return denied_access_count_++; }
++  int AccessCount() {return access_count_++;}
++  int insertedScriptCount() { return inserted_script_count_++; }
++
++  // Document Info Manager
++  bool setScriptID2URL(const int, const String&);
++  const String& getScriptID2URL(const int);
++
++  bool isSensitiveAPIsDisabled() { return !getPageNavigationFlag(); }
++
++  void setPageNavigationFlag(bool);
++
++  bool getPageNavigationFlag() const;
++
++  bool navigationFlag() const{ return getPageNavigationFlag(); }
++  void setNavigationFlag(bool flag) { 
++    setPageNavigationFlag(flag);
++  }
++
++  bool generationFlag() const{ return generationFlag_; }
++  
++  FILE* getAccessLog() { if(!access_log_) setAccessLog(); return access_log_; }
++  void setAccessLog(){
++    if (!access_log_) {
++      access_log_ = fopen("Access.log", "a");
++    }
++  }
++
++  FILE* getViolationLog() { if(!violation_log_) setViolationLog(); return violation_log_; }
++  void setViolationLog(){
++    if (!violation_log_) {
++      violation_log_ = fopen("Violation.log", "a");
++    }
++  }
+ 
+   SnapCoordinator& GetSnapCoordinator();
+   void PerformScrollSnappingTasks();
+@@ -2065,7 +2105,14 @@ class CORE_EXPORT Document : public ContainerNode,
+   Member<IntersectionObserverController> intersection_observer_controller_;
+ 
+   int node_count_;
+-
++  int unique_node_count_;
++  int record_access_count_;
++  int allowed_access_count_;
++  int denied_access_count_;
++  int access_count_;
++  int inserted_script_count_;
++  bool generationFlag_;
++  
+   bool may_contain_v0_shadow_ = false;
+ 
+   Member<SnapCoordinator> snap_coordinator_;
+@@ -2090,6 +2137,10 @@ class CORE_EXPORT Document : public ContainerNode,
+   // successful and not successful) by the page.
+   std::unique_ptr<FontMatchingMetrics> font_matching_metrics_;
+ 
++  // Document Info Manager
++  DocumentInfoManager m_documentInfoManager;
++  FILE* access_log_ = nullptr;
++  FILE* violation_log_ = nullptr;
+ #if DCHECK_IS_ON()
+   unsigned slot_assignment_recalc_forbidden_recursion_depth_ = 0;
+ #endif
+@@ -2229,6 +2280,15 @@ inline void Document::ScheduleLayoutTreeUpdateIfNeeded() {
+     ScheduleLayoutTreeUpdate();
+ }
+ 
++inline bool Document::setScriptID2URL(
++    const int scriptID, const String& sourceURL) {
++  return m_documentInfoManager.setScriptID2URL(scriptID, sourceURL);
++}
++
++inline const String& Document::getScriptID2URL(const int scriptID) {
++  return m_documentInfoManager.getScriptID2URL(scriptID);
++}
++
+ #define DEFINE_DOCUMENT_TYPE_CASTS(thisType)                                \
+   DEFINE_TYPE_CASTS(thisType, Document, document, document->Is##thisType(), \
+                     document.Is##thisType())
+diff --git a/core/dom/document.idl b/core/dom/document.idl
+index e20a55bb1..0acb72213 100644
+--- a/core/dom/document.idl
++++ b/core/dom/document.idl
+@@ -92,6 +92,7 @@ typedef (HTMLScriptElement or SVGScriptElement) HTMLOrSVGScriptElement;
+     [Affects=Nothing, RaisesException, RuntimeCallStatsCounter=DocumentCookie] attribute DOMString cookie;
+     readonly attribute DOMString lastModified;
+     readonly attribute DocumentReadyState readyState;
++    attribute boolean navigationFlag;
+ 
+     // DOM tree accessors
+     // Named getter is implemented without IDL code generation for better
+diff --git a/core/dom/document_info_manager.cc b/core/dom/document_info_manager.cc
+new file mode 100644
+index 000000000..379326550
+--- /dev/null
++++ b/core/dom/document_info_manager.cc
+@@ -0,0 +1,26 @@
++#include "config.h"
++#include "base/environment.h"
++#include "third_party/blink/renderer/core/dom/document_info_manager.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_hash.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
++#include "third_party/blink/renderer/platform/json/json_values.h"
++
++#include <iostream>
++
++namespace blink {
++
++bool DocumentInfoManager::setScriptID2URL(int scriptID, const String& sourceURL)
++{
++    HashMap<int, String>::AddResult addResult = m_scriptID2URL.Set(scriptID, sourceURL);
++    return addResult.is_new_entry;
++}
++
++const String& DocumentInfoManager::getScriptID2URL(int scriptID)
++{
++    HashMap<int, String>::iterator it = m_scriptID2URL.find(scriptID);
++    if (it == m_scriptID2URL.end())
++        return m_emptyString;
++    return it->value;
++}
++
++}
+\ No newline at end of file
+diff --git a/core/dom/document_info_manager.h b/core/dom/document_info_manager.h
+new file mode 100644
+index 000000000..5235be588
+--- /dev/null
++++ b/core/dom/document_info_manager.h
+@@ -0,0 +1,26 @@
++#ifndef Document_Info_Manager_H
++#define Document_Info_Manager_H
++
++#include "third_party/blink/renderer/platform/heap/handle.h"
++#include "third_party/blink/renderer/platform/wtf/hash_map.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++namespace blink {
++
++class DocumentInfoManager {
++public:
++    DocumentInfoManager() {}
++    
++    ~DocumentInfoManager() {}
++
++    bool setScriptID2URL(int, const String&);
++    const String& getScriptID2URL(int);
++
++private:
++    HashMap<int, String> m_scriptID2URL; // scriptID -> sourceURL
++    String m_emptyString;
++};
++
++}
++
++#endif // Document_Info_Manager_H
+\ No newline at end of file
+diff --git a/core/dom/element.cc b/core/dom/element.cc
+index 3c8b9a1b1..d1cc917f2 100644
+--- a/core/dom/element.cc
++++ b/core/dom/element.cc
+@@ -5791,9 +5791,14 @@ Node::InsertionNotificationRequest Node::InsertedInto(
+   DCHECK(!NeedsStyleInvalidation());
+   DCHECK(insertion_point.isConnected() || insertion_point.IsInShadowTree() ||
+          IsContainerNode());
++  Document& document=insertion_point.GetDocument();
+   if (insertion_point.isConnected()) {
+     SetFlag(kIsConnectedFlag);
+-    insertion_point.GetDocument().IncrementNodeCount();
++    document.IncrementNodeCount();
++  }
++  this->setNid(document.UniqueNodeCount());
++  if (document.generationFlag() &&this->IsHTMLElement()){
++    DynamicTo<HTMLElement>(this)->SetNidAttr();
+   }
+   if (ParentOrShadowHostNode()->IsInShadowTree())
+     SetFlag(kIsInShadowTreeFlag);
+@@ -5934,6 +5939,19 @@ StylePropertyMapReadOnly* Element::ComputedStyleMap() {
+   return GetDocument().ComputedStyleMap(this);
+ }
+ 
++const AtomicString Element::nid() const{
++  AtomicString value = AtomicString::Number(getNid());
++  return value;
++}
++
++void Element::SetNidAttr() {
++  if(AttrIfExists(html_names::kNidAttr)){
++    return;
++  }
++  AtomicString value = AtomicString::Number(getNid());
++  setAttribute(html_names::kNidAttr, value);
++}
++
+ MutableCSSPropertyValueSet& Element::EnsureMutableInlineStyle() {
+   DCHECK(IsStyledElement());
+   Member<CSSPropertyValueSet>& inline_style =
+diff --git a/core/dom/element.h b/core/dom/element.h
+index a46e9abb2..d13e94065 100644
+--- a/core/dom/element.h
++++ b/core/dom/element.h
+@@ -369,6 +369,9 @@ class CORE_EXPORT Element : public ContainerNode, public Animatable {
+   StylePropertyMap* attributeStyleMap();
+   StylePropertyMapReadOnly* ComputedStyleMap();
+ 
++  const AtomicString nid() const override;
++
++  void SetNidAttr();
+   const QualifiedName& TagQName() const { return tag_name_; }
+   String tagName() const { return nodeName(); }
+ 
+@@ -782,6 +785,9 @@ class CORE_EXPORT Element : public ContainerNode, public Animatable {
+   virtual bool IsVTTCueBackgroundBox() const { return false; }
+   virtual bool IsSliderThumbElement() const { return false; }
+ 
++  virtual bool IsHTMLScriptElement() const { return false; }
++  virtual bool IsCPPPolicyElement() const { return false; }
++  
+   // Elements that may have an insertion mode other than "in body" should
+   // override this and return true.
+   // https://html.spec.whatwg.org/C/#reset-the-insertion-mode-appropriately
+@@ -1251,6 +1257,7 @@ class CORE_EXPORT Element : public ContainerNode, public Animatable {
+       const QualifiedName& name);
+ 
+   Member<ElementData> element_data_;
++  bool nid_attr_flag_;
+ };
+ 
+ template <typename T>
+diff --git a/core/dom/element.idl b/core/dom/element.idl
+index b83ed0eab..3e601e8a2 100644
+--- a/core/dom/element.idl
++++ b/core/dom/element.idl
+@@ -69,8 +69,8 @@ callback ScrollStateCallback = void (ScrollState scrollState);
+     [Affects=Nothing] HTMLCollection getElementsByTagNameNS(DOMString? namespaceURI, DOMString localName);
+     [Affects=Nothing] HTMLCollection getElementsByClassName(DOMString classNames);
+ 
+-    [RaisesException, CEReactions, CustomElementCallbacks] Element? insertAdjacentElement(DOMString where, Element element);
+-    [RaisesException] void insertAdjacentText(DOMString where, DOMString data);
++    [RaisesException, CEReactions, CustomElementCallbacks, CheckSecurity=CPPWrite] Element? insertAdjacentElement(DOMString where, Element element);
++    [RaisesException, CheckSecurity=CPPWrite] void insertAdjacentText(DOMString where, DOMString data);
+ 
+     // CSS Shadow Parts
+     // https://drafts.csswg.org/css-shadow-parts/#idl
+@@ -94,10 +94,10 @@ callback ScrollStateCallback = void (ScrollState scrollState);
+     // https://crbug.com/1058762 has been fixed.
+     [Affects=Nothing, CEReactions, CustomElementCallbacks, RuntimeCallStatsCounter=ElementInnerHTML, RaisesException=Setter] attribute [TreatNullAs=EmptyString, StringContext=TrustedHTML] DOMString innerHTML;
+     [Affects=Nothing, CEReactions, CustomElementCallbacks, RaisesException=Setter] attribute [TreatNullAs=EmptyString, StringContext=TrustedHTML] DOMString outerHTML;
+-    [CEReactions, CustomElementCallbacks, RaisesException] void insertAdjacentHTML(DOMString position, HTMLString text);
++    [CEReactions, CustomElementCallbacks, RaisesException, CheckSecurity=CPPWrite] void insertAdjacentHTML(DOMString position, HTMLString text);
+ 
+     // Declarative Shadow DOM getInnerHTML() function.
+-    [RuntimeEnabled=DeclarativeShadowDOM, RuntimeCallStatsCounter=ElementGetInnerHTML] HTMLString getInnerHTML(optional GetInnerHTMLOptions options = {});
++    [RuntimeEnabled=DeclarativeShadowDOM, RuntimeCallStatsCounter=ElementGetInnerHTML, CheckSecurity=CPPRead] HTMLString getInnerHTML(optional GetInnerHTMLOptions options = {});
+ 
+     // Pointer Lock
+     // https://w3c.github.io/pointerlock/#extensions-to-the-element-interface
+diff --git a/core/dom/events/event_listener.h b/core/dom/events/event_listener.h
+index be9514501..aadac202d 100644
+--- a/core/dom/events/event_listener.h
++++ b/core/dom/events/event_listener.h
+@@ -87,10 +87,11 @@ class CORE_EXPORT EventListener : public GarbageCollected<EventListener>,
+ 
+   probe::AsyncTaskId* async_task_id() { return &async_task_id_; }
+ 
++  int initiator_;
++
+  private:
+   EventListener() = default;
+   probe::AsyncTaskId async_task_id_;
+-
+   // Only these two classes are direct subclasses of EventListener.  Other
+   // subclasses must inherit from either of them.
+   friend class JSBasedEventListener;
+diff --git a/core/dom/events/event_target.cc b/core/dom/events/event_target.cc
+index 30c6510a4..11957b20f 100644
+--- a/core/dom/events/event_target.cc
++++ b/core/dom/events/event_target.cc
+@@ -64,6 +64,9 @@
+ #include "third_party/blink/renderer/platform/wtf/threading.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
+ 
++
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ namespace {
+ 
+diff --git a/core/dom/events/event_target.idl b/core/dom/events/event_target.idl
+index f80e00714..ec8a03087 100644
+--- a/core/dom/events/event_target.idl
++++ b/core/dom/events/event_target.idl
+@@ -26,7 +26,7 @@
+     ImmutablePrototype
+ ] interface EventTarget {
+     [CallWith=ScriptState] constructor();
+-    void addEventListener(DOMString type, EventListener? listener, optional (AddEventListenerOptions or boolean) options);
+-    void removeEventListener(DOMString type, EventListener? listener, optional (EventListenerOptions or boolean) options);
++    [CheckSecurity=CPPWrite]void addEventListener(DOMString type, EventListener? listener, optional (AddEventListenerOptions or boolean) options);
++    [CheckSecurity=CPPWrite]void removeEventListener(DOMString type, EventListener? listener, optional (EventListenerOptions or boolean) options);
+     [ImplementedAs=dispatchEventForBindings, RaisesException, RuntimeCallStatsCounter=EventTargetDispatchEvent] boolean dispatchEvent(Event event);
+ };
+diff --git a/core/dom/node.cc b/core/dom/node.cc
+index cef59fe04..2b7cb40ee 100644
+--- a/core/dom/node.cc
++++ b/core/dom/node.cc
+@@ -178,6 +178,7 @@ struct SameSizeAsNode : EventTarget {
+   uint32_t node_flags_;
+   Member<void*> willbe_member_[4];
+   Member<NodeData> member_;
++  int nid_;
+ #if !DCHECK_IS_ON()
+   // Increasing size of Member increases size of Node.
+   ASSERT_SIZE(Member<NodeData>, void*);
+@@ -1535,8 +1536,21 @@ bool Node::IsInert() const {
+ unsigned Node::NodeIndex() const {
+   const Node* temp_node = previousSibling();
+   unsigned count = 0;
+-  for (count = 0; temp_node; count++)
++  for (count = 0; temp_node; count++){
+     temp_node = temp_node->previousSibling();
++  }
++  return count;
++}
++
++unsigned Node::ElementIndex() const {
++  const Node* temp_node = previousSibling();
++  unsigned count = 0;
++  for (count = 0; temp_node; ){
++    temp_node = temp_node->previousSibling();
++    if(temp_node&&temp_node->IsHTMLElement()){
++      count++;
++    }
++  }
+   return count;
+ }
+ 
+diff --git a/core/dom/node.h b/core/dom/node.h
+index 261c41a49..aff393821 100644
+--- a/core/dom/node.h
++++ b/core/dom/node.h
+@@ -36,13 +36,15 @@
+ #include "third_party/blink/renderer/core/dom/tree_scope.h"
+ #include "third_party/blink/renderer/core/scroll/scroll_customization.h"
+ #include "third_party/blink/renderer/core/style/computed_style_constants.h"
+-
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ // This needs to be here because element.cc also depends on it.
+ #define DUMP_NODE_STATISTICS 0
+ 
+ namespace blink {
+ 
+ class ComputedStyle;
++class PolicyData;
++class ExecutionContext;
+ class ContainerNode;
+ class Document;
+ class Element;
+@@ -619,6 +621,7 @@ class CORE_EXPORT Node : public EventTarget {
+   PhysicalRect BoundingBoxForScrollIntoView() const;
+ 
+   unsigned NodeIndex() const;
++  unsigned ElementIndex() const;
+ 
+   // Returns the DOM ownerDocument attribute. This method never returns null,
+   // except in the case of a Document node.
+@@ -752,6 +755,7 @@ class CORE_EXPORT Node : public EventTarget {
+   // these functions.
+   ComputedStyle* MutableComputedStyleForEditingDeprecated() const;
+   const ComputedStyle* GetComputedStyle() const;
++  const PolicyData* GetContentProtectionPolicyData() const;
+   const ComputedStyle* ParentComputedStyle() const;
+   const ComputedStyle& ComputedStyleRef() const;
+   bool ShouldSkipMarkingStyleDirty() const;
+@@ -761,6 +765,12 @@ class CORE_EXPORT Node : public EventTarget {
+     return VirtualEnsureComputedStyle(pseudo_element_specifier);
+   }
+ 
++  //JS Isolation
++  virtual const AtomicString nid() const{ return g_null_atom; }
++  int getNid() const { return nid_; }
++  void setNid(int nid) { nid_ = nid; }
++  void setNid(String nid) { nid_ = nid.ToInt(); }
++
+   // ---------------------------------------------------------------------------
+   // Notification of document structure changes (see container_node.h for more
+   // notification methods)
+@@ -1142,6 +1152,9 @@ class CORE_EXPORT Node : public EventTarget {
+   Member<Node> next_;
+   // When a node has rare data we move the layoutObject into the rare data.
+   Member<NodeData> data_;
++
++  int nid_;
++
+ };
+ 
+ inline void Node::SetParentOrShadowHostNode(ContainerNode* parent) {
+diff --git a/core/dom/node.idl b/core/dom/node.idl
+index f3e793fdb..8ee507266 100644
+--- a/core/dom/node.idl
++++ b/core/dom/node.idl
+@@ -39,6 +39,7 @@
+     [Affects=Nothing, RuntimeCallStatsCounter=NodeName] readonly attribute DOMString nodeName;
+ 
+     readonly attribute USVString baseURI;
++    readonly attribute DOMString nid;
+ 
+     // Scroll Customization API. See crbug.com/410974 for details.
+     [RuntimeEnabled=ScrollCustomization] void setApplyScroll(ScrollStateCallback scrollStateCallback, NativeScrollBehavior nativeScrollBehavior);
+@@ -78,8 +79,8 @@
+     DOMString? lookupNamespaceURI(DOMString? prefix);
+     boolean isDefaultNamespace(DOMString? namespaceURI);
+ 
+-    [CEReactions, CustomElementCallbacks, PerWorldBindings, RaisesException] Node insertBefore(Node node, Node? child);
+-    [CEReactions, CustomElementCallbacks, PerWorldBindings, RaisesException, RuntimeCallStatsCounter=NodeAppendChild] Node appendChild(Node node);
+-    [CEReactions, CustomElementCallbacks, PerWorldBindings, RaisesException] Node replaceChild(Node node, Node child);
+-    [CEReactions, CustomElementCallbacks, RaisesException, RuntimeCallStatsCounter=NodeRemoveChild] Node removeChild(Node child);
++    [CEReactions, CustomElementCallbacks, PerWorldBindings, RaisesException, CheckSecurity=CPPWrite] Node insertBefore(Node node, Node? child);
++    [CEReactions, CustomElementCallbacks, PerWorldBindings, RaisesException, RuntimeCallStatsCounter=NodeAppendChild, CheckSecurity=CPPWrite] Node appendChild(Node node);
++    [CEReactions, CustomElementCallbacks, PerWorldBindings, RaisesException, CheckSecurity=CPPWrite] Node replaceChild(Node node, Node child);
++    [CEReactions, CustomElementCallbacks, RaisesException, RuntimeCallStatsCounter=NodeRemoveChild, CheckSecurity=CPPWrite] Node removeChild(Node child);
+ };
+diff --git a/core/dom/node_computed_style.h b/core/dom/node_computed_style.h
+index 3d28403dd..67db3c520 100644
+--- a/core/dom/node_computed_style.h
++++ b/core/dom/node_computed_style.h
+@@ -50,6 +50,14 @@ inline const ComputedStyle* Node::GetComputedStyle() const {
+   return nullptr;
+ }
+ 
++inline const PolicyData* Node::GetContentProtectionPolicyData() const {
++  if (IsElementNode()) {
++    if (GetComputedStyle())
++      return GetComputedStyle()->GetPolicyData();
++  }
++  return nullptr;
++}
++
+ inline const ComputedStyle* Node::ParentComputedStyle() const {
+   if (!CanParticipateInFlatTree())
+     return nullptr;
+diff --git a/core/editing/element_inner_text.cc b/core/editing/element_inner_text.cc
+index 9e8dbef2d..f0ec43c5f 100644
+--- a/core/editing/element_inner_text.cc
++++ b/core/editing/element_inner_text.cc
+@@ -31,6 +31,8 @@
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
+ 
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
++
+ namespace blink {
+ 
+ namespace {
+@@ -268,6 +270,9 @@ void ElementInnerTextCollector::ProcessNode(const Node& node) {
+   // 2. If the node is display locked, then we should not process it or its
+   // children, since they are not visible or accessible via innerText.
+   if (auto* element = DynamicTo<Element>(node)) {
++    if (!BindingSecurity::CPPCheckAccess(*element,1)){      
++      return;
++    }
+     auto* context = element->GetDisplayLockContext();
+     if (context && context->IsLocked())
+       return;
+diff --git a/core/editing/serializers/markup_accumulator.cc b/core/editing/serializers/markup_accumulator.cc
+index 3b6c034c9..431c4695e 100644
+--- a/core/editing/serializers/markup_accumulator.cc
++++ b/core/editing/serializers/markup_accumulator.cc
+@@ -43,6 +43,8 @@
+ #include "third_party/blink/renderer/platform/weborigin/kurl.h"
+ #include "third_party/blink/renderer/platform/wtf/text/character_names.h"
+ 
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
++
+ namespace blink {
+ 
+ class MarkupAccumulator::NamespaceContext final {
+@@ -182,6 +184,9 @@ bool MarkupAccumulator::ShouldIgnoreAttribute(
+ }
+ 
+ bool MarkupAccumulator::ShouldIgnoreElement(const Element& element) const {
++  if (!BindingSecurity::CPPCheckAccess(element,1)){
++    return true;
++  }
+   return false;
+ }
+ 
+diff --git a/core/execution_context/execution_context.cc b/core/execution_context/execution_context.cc
+index 28e4233b0..4497e2f54 100644
+--- a/core/execution_context/execution_context.cc
++++ b/core/execution_context/execution_context.cc
+@@ -68,7 +68,7 @@ ExecutionContext::ExecutionContext(v8::Isolate* isolate, Agent* agent)
+       window_interaction_tokens_(0),
+       referrer_policy_(network::mojom::ReferrerPolicy::kDefault),
+       address_space_(network::mojom::blink::IPAddressSpace::kUnknown),
+-      origin_trial_context_(MakeGarbageCollected<OriginTrialContext>(this)) {
++      origin_trial_context_(MakeGarbageCollected<OriginTrialContext>(this)){
+   DCHECK(agent_);
+ }
+ 
+diff --git a/core/frame/csp/csp_source.h b/core/frame/csp/csp_source.h
+index 8f4cb0533..9edea4871 100644
+--- a/core/frame/csp/csp_source.h
++++ b/core/frame/csp/csp_source.h
+@@ -53,15 +53,8 @@ class CORE_EXPORT CSPSource final : public GarbageCollected<CSPSource> {
+ 
+   bool MatchesAsSelf(const KURL&);
+ 
+-  // Returns true if this CSPSource subsumes the other, as defined by the
+-  // algorithm at https://w3c.github.io/webappsec-csp/embedded/#subsume-policy
+   bool Subsumes(CSPSource*) const;
+-  // Retrieve the most restrictive information from the two CSPSources if
+-  // isSimilar is true for the two. Otherwise, return nullptr.
+   CSPSource* Intersect(CSPSource*) const;
+-  // Returns true if the first list subsumes the second, as defined by the
+-  // algorithm at
+-  // https://w3c.github.io/webappsec-csp/embedded/#subsume-source-list
+   static bool FirstSubsumesSecond(const HeapVector<Member<CSPSource>>&,
+                                   const HeapVector<Member<CSPSource>>&);
+ 
+diff --git a/core/frame/local_frame.cc b/core/frame/local_frame.cc
+index 8ffe4511f..a3f291ddf 100644
+--- a/core/frame/local_frame.cc
++++ b/core/frame/local_frame.cc
+@@ -484,6 +484,13 @@ void LocalFrame::Navigate(FrameLoadRequest& request,
+   if (HTMLFrameOwnerElement* element = DeprecatedLocalOwner())
+     element->CancelPendingLazyLoad();
+ 
++  //CPP disbale navigation
++  Document* active_document = GetDocument();
++  if (active_document->isSensitiveAPIsDisabled()) {
++    if (!request.GetResourceRequest().Url().ProtocolIsJavaScript())
++      return;
++  }
++
+   if (!navigation_rate_limiter().CanProceed())
+     return;
+ 
+diff --git a/core/html/build.gni b/core/html/build.gni
+index 2c41552f9..4b81ff3b7 100644
+--- a/core/html/build.gni
++++ b/core/html/build.gni
+@@ -3,6 +3,8 @@
+ # found in the LICENSE file.
+ 
+ blink_core_sources_html = [
++  "cpp_policy_element.cc",
++  "cpp_policy_element.h",
+   "anchor_element_metrics.cc",
+   "anchor_element_metrics.h",
+   "anchor_element_metrics_sender.cc",
+diff --git a/core/html/cpp_policy_element.cc b/core/html/cpp_policy_element.cc
+new file mode 100644
+index 000000000..5b4d693de
+--- /dev/null
++++ b/core/html/cpp_policy_element.cc
+@@ -0,0 +1,83 @@
++#include "third_party/blink/renderer/core/html/cpp_policy_element.h"
++#include <iostream>
++#include "third_party/blink/public/platform/task_type.h"
++#include "third_party/blink/renderer/core/css/media_list.h"
++#include "third_party/blink/renderer/core/css/style_engine.h"
++#include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/dom/events/event.h"
++#include "third_party/blink/renderer/core/dom/shadow_root.h"
++#include "third_party/blink/renderer/core/html_names.h"
++#include "third_party/blink/renderer/platform/wtf/functional.h"
++namespace blink {
++
++CPPPolicyElement::CPPPolicyElement(Document& document,
++                                   const CreateElementFlags flags)
++    : HTMLElement(html_names::kStyleTag, document),
++      StyleElement(&document, flags.IsCreatedByParser()),
++      is_created_by_parser_(flags.IsCreatedByParser()) {}
++
++CPPPolicyElement::~CPPPolicyElement() = default;
++
++void CPPPolicyElement::ParseAttribute(
++    const AttributeModificationParams& params) {
++  if (params.name == html_names::kTitleAttr && sheet_ && IsInDocumentTree()) {
++    sheet_->SetTitle(params.new_value);
++  } else if (params.name == html_names::kMediaAttr && isConnected() &&
++             GetDocument().IsActive() && sheet_) {
++    sheet_->SetMediaQueries(
++        MediaQuerySet::Create(params.new_value, GetExecutionContext()));
++    GetDocument().GetStyleEngine().MediaQueriesChangedInScope(GetTreeScope());
++  } else {
++    HTMLElement::ParseAttribute(params);
++  }
++}
++
++void CPPPolicyElement::FinishParsingChildren() {
++  if(IsValid()){
++    StyleElement::FinishParsingChildren(*this);
++  }
++  HTMLElement::FinishParsingChildren();
++}
++
++Node::InsertionNotificationRequest CPPPolicyElement::InsertedInto(
++    ContainerNode& insertion_point) {
++  HTMLElement::InsertedInto(insertion_point);
++  if (isConnected()&&IsValid()) {
++    StyleElement::ProcessStyleSheet(GetDocument(), *this);
++  }
++  return kInsertionDone;
++}
++
++void CPPPolicyElement::RemovedFrom(ContainerNode& insertion_point) {
++  HTMLElement::RemovedFrom(insertion_point);
++}
++
++void CPPPolicyElement::ChildrenChanged(const ChildrenChange& change) {
++  HTMLElement::ChildrenChanged(change);
++}
++
++const AtomicString& CPPPolicyElement::media() const {
++  return FastGetAttribute(html_names::kMediaAttr);
++}
++
++const AtomicString& CPPPolicyElement::type() const {
++  return FastGetAttribute(html_names::kTypeAttr);
++}
++
++bool CPPPolicyElement::disabled() const {
++  if (!sheet_)
++    return false;
++
++  return sheet_->disabled();
++}
++
++void CPPPolicyElement::setDisabled(bool set_disabled) {
++  if (CSSStyleSheet* style_sheet = sheet())
++    style_sheet->setDisabled(set_disabled);
++}
++
++void CPPPolicyElement::Trace(Visitor* visitor) const {
++  StyleElement::Trace(visitor);
++  HTMLElement::Trace(visitor);
++}
++}  // namespace blink
+diff --git a/core/html/cpp_policy_element.h b/core/html/cpp_policy_element.h
+new file mode 100644
+index 000000000..617797360
+--- /dev/null
++++ b/core/html/cpp_policy_element.h
+@@ -0,0 +1,56 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_HTML_HTML_CPP_POLICY_ELEMENT_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_HTML_HTML_CPP_POLICY_ELEMENT_H_
++
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/html/html_element.h"
++#include "third_party/blink/renderer/core/css/style_element.h"
++#include <memory>
++
++namespace blink {
++
++class CORE_EXPORT CPPPolicyElement final : public HTMLElement,
++                                           private StyleElement {
++  // DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  CPPPolicyElement(Document&, const CreateElementFlags);
++  ~CPPPolicyElement() override;
++
++  using StyleElement::sheet;
++
++  bool disabled() const;
++  void setDisabled(bool);
++
++  void Trace(Visitor*) const override;
++
++  bool IsCPPPolicyElement() const override { return true; } 
++
++  bool IsValid() const {return is_created_by_parser_;}
++
++ private:
++  // overload from HTMLElement
++  void ParseAttribute(const AttributeModificationParams&) override;
++  InsertionNotificationRequest InsertedInto(ContainerNode&) override;
++  void RemovedFrom(ContainerNode&) override;
++  void ChildrenChanged(const ChildrenChange&) override;
++
++  void FinishParsingChildren() override;
++
++  bool SheetLoaded() override {
++    return StyleElement::SheetLoaded(GetDocument());
++  }
++
++  void StartLoadingDynamicSheet() override {
++    StyleElement::StartLoadingDynamicSheet(GetDocument());
++  }
++
++  const AtomicString& media() const override;
++  const AtomicString& type() const override;
++  bool is_created_by_parser_ : 1;
++};
++
++
++}  // namespace blink
++
++#endif
+diff --git a/core/html/cpp_policy_element.idl b/core/html/cpp_policy_element.idl
+new file mode 100644
+index 000000000..fb47e6691
+--- /dev/null
++++ b/core/html/cpp_policy_element.idl
+@@ -0,0 +1,10 @@
++[
++    Exposed=Window,
++    HTMLConstructor
++] interface HTMLStyleElement : HTMLElement {
++    [Measure] attribute boolean disabled;
++    [CEReactions, Reflect] attribute DOMString media;
++    [CEReactions, Reflect] attribute DOMString type;
++
++    readonly attribute StyleSheet? sheet;
++};
+\ No newline at end of file
+diff --git a/core/html/forms/html_button_element.cc b/core/html/forms/html_button_element.cc
+index c0b6a74c6..5a340e711 100644
+--- a/core/html/forms/html_button_element.cc
++++ b/core/html/forms/html_button_element.cc
+@@ -35,6 +35,9 @@
+ #include "third_party/blink/renderer/core/style/computed_style.h"
+ #include "third_party/blink/renderer/platform/wtf/std_lib_extras.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ 
+ HTMLButtonElement::HTMLButtonElement(Document& document)
+@@ -102,8 +105,18 @@ void HTMLButtonElement::ParseAttribute(
+     if (formOwner() && isConnected())
+       formOwner()->InvalidateDefaultButtonStyle();
+   } else {
+-    if (params.name == html_names::kFormactionAttr)
++    if (params.name == html_names::kFormactionAttr){
+       LogUpdateAttributeIfIsolatedWorldAndInDocument("button", params);
++      String parsed_url = params.new_value;
++      if (ProtocolIs(parsed_url, "javascript")){
++        v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++        if (!frame.IsEmpty()){
++          v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++          String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++          setInitiator(frameSourceURL);
++        }
++      }
++    }
+     HTMLFormControlElement::ParseAttribute(params);
+   }
+ }
+diff --git a/core/html/forms/html_form_element.cc b/core/html/forms/html_form_element.cc
+index 1ad02fb5d..0c9995e92 100644
+--- a/core/html/forms/html_form_element.cc
++++ b/core/html/forms/html_form_element.cc
+@@ -68,6 +68,9 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ 
+ HTMLFormElement::HTMLFormElement(Document& document)
+@@ -326,6 +329,7 @@ void HTMLFormElement::PrepareForSubmission(
+                       DispatchEventResult::kNotCanceled;
+     }
+   }
++
+   if (should_submit) {
+     ScheduleFormSubmission(event, submit_button);
+   }
+@@ -380,6 +384,7 @@ void HTMLFormElement::SubmitDialog(FormSubmission* form_submission) {
+ void HTMLFormElement::ScheduleFormSubmission(
+     const Event* event,
+     HTMLFormControlElement* submit_button) {
++
+   LocalFrameView* view = GetDocument().View();
+   LocalFrame* frame = GetDocument().GetFrame();
+   if (!view || !frame || !frame->GetPage())
+@@ -587,6 +592,15 @@ void HTMLFormElement::ParseAttribute(
+     attributes_.ParseAction(params.new_value);
+     LogUpdateAttributeIfIsolatedWorldAndInDocument("form", params);
+ 
++    String parsed_url = params.new_value;
++    if (ProtocolIs(parsed_url, "javascript")){
++      v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++      if (!frame.IsEmpty()){
++        v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++        String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++        setInitiator(frameSourceURL);
++      }
++    }
+     // If we're not upgrading insecure requests, and the new action attribute is
+     // pointing to an insecure "action" location from a secure page it is marked
+     // as "passive" mixed content.
+diff --git a/core/html/forms/html_input_element.cc b/core/html/forms/html_input_element.cc
+index e1064b872..09771b4ea 100644
+--- a/core/html/forms/html_input_element.cc
++++ b/core/html/forms/html_input_element.cc
+@@ -86,6 +86,9 @@
+ #include "third_party/blink/renderer/platform/wtf/math_extras.h"
+ #include "ui/base/ui_base_features.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ 
+ namespace {
+@@ -893,8 +896,18 @@ void HTMLInputElement::ParseAttribute(
+     TextControlElement::ParseAttribute(params);
+     UseCounter::Count(GetDocument(), WebFeature::kPrefixedDirectoryAttribute);
+   } else {
+-    if (name == html_names::kFormactionAttr)
++    if (name == html_names::kFormactionAttr){
+       LogUpdateAttributeIfIsolatedWorldAndInDocument("input", params);
++      String parsed_url = params.new_value;
++      if (ProtocolIs(parsed_url, "javascript")){
++        v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++        if (!frame.IsEmpty()){
++          v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++          String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++          setInitiator(frameSourceURL);
++        }
++      }
++    }
+     TextControlElement::ParseAttribute(params);
+   }
+ }
+diff --git a/core/html/html_anchor_element.cc b/core/html/html_anchor_element.cc
+index 6a42b83e5..bafeaff44 100644
+--- a/core/html/html_anchor_element.cc
++++ b/core/html/html_anchor_element.cc
+@@ -59,6 +59,8 @@
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_policy.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
+ namespace blink {
+ 
+ namespace {
+@@ -184,6 +186,7 @@ static void AppendServerMapMousePosition(StringBuilder& url, Event* event) {
+ 
+ void HTMLAnchorElement::DefaultEventHandler(Event& event) {
+   if (IsLink()) {
++
+     if (IsFocused() && IsEnterKeyKeydownEvent(event) && IsLiveLink()) {
+       event.SetDefaultHandled();
+       DispatchSimulatedClick(&event);
+@@ -248,6 +251,14 @@ void HTMLAnchorElement::ParseAttribute(
+           }
+         }
+       }
++      if (ProtocolIs(parsed_url, "javascript")){
++        v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++        if (!frame.IsEmpty()){
++          v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++          String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++          setInitiator(frameSourceURL);
++        }
++      }
+     }
+     InvalidateCachedVisitedLinkHash();
+     LogUpdateAttributeIfIsolatedWorldAndInDocument("a", params);
+@@ -481,11 +492,11 @@ void HTMLAnchorElement::HandleClick(Event& event) {
+       FastGetAttribute(html_names::kHrefAttr)));
+   AppendServerMapMousePosition(url, &event);
+   KURL completed_url = GetDocument().CompleteURL(url.ToString());
+-
++  if (getInitiator())
++    completed_url.JsUrlInitiator_=getInitiator();
+   // Schedule the ping before the frame load. Prerender in Chrome may kill the
+   // renderer as soon as the navigation is sent out.
+   SendPings(completed_url);
+-
+   ResourceRequest request(completed_url);
+ 
+   network::mojom::ReferrerPolicy policy;
+diff --git a/core/html/html_attribute_names.json5 b/core/html/html_attribute_names.json5
+index 7c7b7942a..26494744b 100644
+--- a/core/html/html_attribute_names.json5
++++ b/core/html/html_attribute_names.json5
+@@ -60,6 +60,7 @@
+     "conversiondestination",
+     "coords",
+     "crossorigin",
++    "cpp",
+     "csp",
+     "data",
+     "datetime",
+@@ -141,6 +142,7 @@
+     "multiple",
+     "muted",
+     "name",
++    "nid",
+     "nohref",
+     "nomodule",
+     "nonce",
+diff --git a/core/html/html_element.cc b/core/html/html_element.cc
+index c1ee60f64..4760f697f 100644
+--- a/core/html/html_element.cc
++++ b/core/html/html_element.cc
+@@ -1692,6 +1692,18 @@ void HTMLElement::FinishParsingChildren() {
+     EnsureElementInternals().TakeStateAndRestore();
+ }
+ 
++void HTMLElement::setChildrenInitiator(String initiator){
++  setInitiator(initiator);
++  NodeList* children = childNodes();
++  int length = children->length();
++  for (int i = 0; i < length; ++i) {
++    Node* child = children->item(i);
++    if (child->IsHTMLElement()) {
++      DynamicTo<HTMLElement>(child)->setChildrenInitiator(initiator);
++    }
++  }
++}
++
+ }  // namespace blink
+ 
+ #ifndef NDEBUG
+diff --git a/core/html/html_element.h b/core/html/html_element.h
+index 0f54c2fa2..0da300c0d 100644
+--- a/core/html/html_element.h
++++ b/core/html/html_element.h
+@@ -153,6 +153,10 @@ class CORE_EXPORT HTMLElement : public Element {
+   virtual FormAssociated* ToFormAssociatedOrNull() { return nullptr; }
+   bool IsFormAssociatedCustomElement() const;
+ 
++  String getInitiator() const { return initiator_; }
++  void setInitiator(String initiator) { initiator_ = initiator; }
++  void setChildrenInitiator(String initiator);
++  String initiator_;
+  protected:
+   enum AllowPercentage { kDontAllowPercentageValues, kAllowPercentageValues };
+   enum AllowZero { kDontAllowZeroValues, kAllowZeroValues };
+diff --git a/core/html/html_frame_element_base.cc b/core/html/html_frame_element_base.cc
+index be6f21a42..982484a64 100644
+--- a/core/html/html_frame_element_base.cc
++++ b/core/html/html_frame_element_base.cc
+@@ -47,6 +47,9 @@
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/platform/heap/heap.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ 
+ HTMLFrameElementBase::HTMLFrameElementBase(const QualifiedName& tag_name,
+@@ -91,6 +94,8 @@ void HTMLFrameElementBase::OpenURL(bool replace_current_item) {
+     return;
+ 
+   KURL url = GetDocument().CompleteURL(url_);
++  if (url.ProtocolIsJavaScript() && getInitiator())
++    url.JsUrlInitiator_=getInitiator();
+   // There is no (easy) way to tell if |url_| is relative at this point. That
+   // is determined in the KURL constructor. If we fail to create an absolute
+   // URL at this point, *and* the base URL is a data URL, assume |url_| was
+@@ -212,6 +217,14 @@ void HTMLFrameElementBase::AttachLayoutTree(AttachContext& context) {
+ }
+ 
+ void HTMLFrameElementBase::SetLocation(const String& str) {
++  if (ProtocolIs(str, "javascript")){
++    v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++    if (!frame.IsEmpty()){
++      v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++      String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++      setInitiator(frameSourceURL);
++    }
++  }
+   url_ = AtomicString(str);
+ 
+   if (isConnected())
+diff --git a/core/html/html_iframe_element.cc b/core/html/html_iframe_element.cc
+index a36767291..c348eb4c5 100644
+--- a/core/html/html_iframe_element.cc
++++ b/core/html/html_iframe_element.cc
+@@ -52,6 +52,9 @@
+ #include "third_party/blink/renderer/platform/json/json_parser.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ 
+ HTMLIFrameElement::HTMLIFrameElement(Document& document)
+diff --git a/core/html/html_script_element.cc b/core/html/html_script_element.cc
+index 692566bb5..28cd5add6 100644
+--- a/core/html/html_script_element.cc
++++ b/core/html/html_script_element.cc
+@@ -41,13 +41,35 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
++#include <iostream>
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/bindings/core/v8/cpp_security.h"
++
+ namespace blink {
+ 
+ HTMLScriptElement::HTMLScriptElement(Document& document,
+                                      const CreateElementFlags flags)
+     : HTMLElement(html_names::kScriptTag, document),
+       children_changed_by_api_(false),
+-      loader_(InitializeScriptLoader(flags)) {}
++      loader_(InitializeScriptLoader(flags)) {
++  if (!flags.IsCreatedByParser()||flags.IsCreatedDuringWrite()) {
++    v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++
++    if (!frame.IsEmpty()) {
++      v8::Local<v8::String> v8_string = frame->GetScriptNameOrSourceURL();
++      String frameSourceURL = toCoreStringOrDefault(v8_string,"Unknown");
++
++      int scriptID = frame->GetScriptId();
++      document.setScriptID2URL(scriptID, frameSourceURL); // Sometimes we cannot catch the DOM access by a parent script in BindingSecurity
++
++      Vector<UChar> characters;
++      frameSourceURL.AppendTo(characters);
++      String tmp="_-INSERTION-_"+String::Number(document.insertedScriptCount());
++      tmp.AppendTo(characters);
++      loader_->setInsertingScriptURL(String(characters));
++    }
++  }
++}
+ 
+ const AttrNameToTrustedType& HTMLScriptElement::GetCheckedAttributeTypes()
+     const {
+diff --git a/core/html/html_script_element.h b/core/html/html_script_element.h
+index c0c0ed94d..12bcc69bc 100644
+--- a/core/html/html_script_element.h
++++ b/core/html/html_script_element.h
+@@ -63,6 +63,8 @@ class CORE_EXPORT HTMLScriptElement final : public HTMLElement,
+   Document& GetDocument() const override;
+   ExecutionContext* GetExecutionContext() const override;
+ 
++  bool IsHTMLScriptElement() const override {return true; }
++
+   void Trace(Visitor*) const override;
+ 
+   void FinishParsingChildren() override;
+diff --git a/core/html/html_tag_names.json5 b/core/html/html_tag_names.json5
+index b85be2291..03b41088f 100644
+--- a/core/html/html_tag_names.json5
++++ b/core/html/html_tag_names.json5
+@@ -116,6 +116,11 @@
+       name: "content",
+       interfaceName: "HTMLContentElement",
+     },
++    {
++      name: "cpp",
++      constructorNeedsCreateElementFlags: true,
++      interfaceName: "CPPPolicyElement",
++    },
+     {
+       name: "data",
+       interfaceName: "HTMLDataElement",
+diff --git a/core/html/parser/html_construction_site.cc b/core/html/parser/html_construction_site.cc
+index 870c7f517..ce7f2f13c 100644
+--- a/core/html/parser/html_construction_site.cc
++++ b/core/html/parser/html_construction_site.cc
+@@ -753,6 +753,10 @@ void HTMLConstructionSite::InsertScriptElement(AtomicHTMLToken* token) {
+   bool should_be_parser_inserted =
+       parser_content_policy_ !=
+       kAllowScriptingContentAndDoNotMarkAlreadyStarted;
++  Document& document = OwnerDocumentForCurrentNode();
++  if (document.IsInDocumentWrite()) {
++    flags.SetCreatedDuringWrite(true);
++  }
+   flags
+       // http://www.whatwg.org/specs/web-apps/current-work/multipage/scripting-1.html#already-started
+       // http://html5.org/specs/dom-parsing.html#dom-range-createcontextualfragment
+@@ -985,8 +989,18 @@ Element* HTMLConstructionSite::CreateElement(
+       element = definition->CreateElement(document, tag_name,
+                                           GetCreateElementFlags());
+     } else {
+-      element = CustomElement::CreateUncustomizedOrUndefinedElement(
+-          document, tag_name, GetCreateElementFlags(), is);
++      if (tag_name.LocalName()=="cpp"){
++        if (is_parsing_fragment_)
++          element = CustomElement::CreateUncustomizedOrUndefinedElement(
++            document, tag_name, GetCreateElementFlags().SetCreatedByParser(false, nullptr), is);
++        else
++          element = CustomElement::CreateUncustomizedOrUndefinedElement(
++            document, tag_name, GetCreateElementFlags(), is);
++      }
++      else{
++        element = CustomElement::CreateUncustomizedOrUndefinedElement(
++            document, tag_name, GetCreateElementFlags(), is);
++      }
+     }
+     // Definition for the created element does not exist here and it cannot be
+     // custom, precustomized, or failed.
+diff --git a/core/loader/form_submission.cc b/core/loader/form_submission.cc
+index 8383a9120..4b298beff 100644
+--- a/core/loader/form_submission.cc
++++ b/core/loader/form_submission.cc
+@@ -216,6 +216,10 @@ FormSubmission* FormSubmission::Create(HTMLFormElement* form,
+                                              ? document.Url().GetString()
+                                              : copied_attributes.Action());
+ 
++  if (submit_button && submit_button->getInitiator()){
++    action_url.JsUrlInitiator_=submit_button->getInitiator();
++  }
++
+   if ((document.domWindow()->GetSecurityContext().GetInsecureRequestPolicy() &
+        mojom::blink::InsecureRequestPolicy::kUpgradeInsecureRequests) !=
+           mojom::blink::InsecureRequestPolicy::kLeaveInsecureRequestsAlone &&
+diff --git a/core/page/page.h b/core/page/page.h
+index c184b1fd4..14783fd6f 100644
+--- a/core/page/page.h
++++ b/core/page/page.h
+@@ -254,6 +254,9 @@ class CORE_EXPORT Page final : public GarbageCollected<Page>,
+   // https://wicg.github.io/page-lifecycle/#sec-lifecycle-states
+   bool Frozen() const { return frozen_; }
+ 
++  bool PageNavigationFlag() const { return pageNavigationFlag_; }
++  void SetPageNavigationFlag (bool value) { pageNavigationFlag_=value; }
++
+   void SetPageScaleFactor(float);
+   float PageScaleFactor() const;
+ 
+@@ -466,6 +469,7 @@ class CORE_EXPORT Page final : public GarbageCollected<Page>,
+   // controlled from the renderer.
+   bool paused_ = false;
+   bool frozen_ = false;
++  bool pageNavigationFlag_ = true;
+ 
+ #if DCHECK_IS_ON()
+   bool is_painting_ = false;
+diff --git a/core/script/script_loader.cc b/core/script/script_loader.cc
+index 5453dee25..ccef9a62e 100644
+--- a/core/script/script_loader.cc
++++ b/core/script/script_loader.cc
+@@ -908,9 +908,13 @@ bool ScriptLoader::PrepareScript(const TextPosition& script_start_position,
+   // Note: this block is also duplicated in
+   // HTMLParserScriptRunner::processScriptElementInternal().
+   // TODO(hiroshige): Merge the duplicated code.
+-  KURL script_url = (!is_in_document_write && parser_inserted_)
+-                        ? element_document.Url()
+-                        : KURL();
++
++  KURL script_url = (!m_insertingScriptURL.IsEmpty())
++                        ? KURL(m_insertingScriptURL)
++                        : ((!is_in_document_write && parser_inserted_)
++                          ? element_document.Url()
++                          : KURL());
++
+   TakePendingScript(ScriptSchedulingType::kImmediate)
+       ->ExecuteScriptBlock(script_url);
+   return true;
+diff --git a/core/script/script_loader.h b/core/script/script_loader.h
+index 9a2d1c56c..32b3695a9 100644
+--- a/core/script/script_loader.h
++++ b/core/script/script_loader.h
+@@ -99,6 +99,8 @@ class CORE_EXPORT ScriptLoader final : public GarbageCollected<ScriptLoader>,
+   bool IsNonBlocking() const { return non_blocking_; }
+   mojom::blink::ScriptType GetScriptType() const { return script_type_; }
+ 
++  void setInsertingScriptURL(String sourceURL) { m_insertingScriptURL = sourceURL; }
++
+   // Helper functions used by our parent classes.
+   void DidNotifySubtreeInsertionsToDocument();
+   void ChildrenChanged();
+@@ -209,6 +211,8 @@ class CORE_EXPORT ScriptLoader final : public GarbageCollected<ScriptLoader>,
+   // and thus to keep it on MemoryCache, even after script execution, as long
+   // as ScriptLoader is alive. crbug.com/778799
+   Member<Resource> resource_keep_alive_;
++  
++  String m_insertingScriptURL;
+ };
+ 
+ }  // namespace blink
+diff --git a/core/style/build.gni b/core/style/build.gni
+index 846e6ee1f..ef58dd2fa 100644
+--- a/core/style/build.gni
++++ b/core/style/build.gni
+@@ -20,6 +20,8 @@ blink_core_sources_style = [
+   "computed_style_constants.h",
+   "content_data.cc",
+   "content_data.h",
++  "policy_data.h",
++  "policy_data.cc",
+   "counter_content.h",
+   "counter_directives.cc",
+   "counter_directives.h",
+diff --git a/core/style/computed_style.cc b/core/style/computed_style.cc
+index 767627b71..565e1751c 100644
+--- a/core/style/computed_style.cc
++++ b/core/style/computed_style.cc
+@@ -1085,6 +1085,10 @@ void ComputedStyle::SetContent(ContentData* content_data) {
+   SetContentInternal(content_data);
+ }
+ 
++void ComputedStyle::SetPolicy(PolicyData* policy_data) {
++  SetPolicyInternal(policy_data);
++}
++
+ static bool IsWillChangeTransformHintProperty(CSSPropertyID property) {
+   switch (property) {
+     case CSSPropertyID::kTransform:
+diff --git a/core/style/computed_style.h b/core/style/computed_style.h
+index c17a5e2eb..f9264430d 100644
+--- a/core/style/computed_style.h
++++ b/core/style/computed_style.h
+@@ -626,6 +626,10 @@ class ComputedStyle : public ComputedStyleBase,
+   ContentData* GetContentData() const { return ContentInternal().Get(); }
+   void SetContent(ContentData*);
+ 
++  // policy
++  PolicyData* GetPolicyData() const { return PolicyInternal().Get(); }
++  void SetPolicy(PolicyData*);
++
+   // -webkit-line-clamp
+   bool HasLineClamp() const { return LineClamp() > 0; }
+ 
+diff --git a/core/style/policy_data.cc b/core/style/policy_data.cc
+new file mode 100644
+index 000000000..2d886dddf
+--- /dev/null
++++ b/core/style/policy_data.cc
+@@ -0,0 +1,427 @@
++#include "third_party/blink/renderer/core/style/policy_data.h"
++#include <memory>
++#include "third_party/blink/renderer/platform/wtf/forward.h"
++#include "third_party/blink/renderer/platform/weborigin/known_ports.h"
++#include "third_party/blink/renderer/platform/wtf/text/parsing_utilities.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_to_number.h"
++#include "third_party/blink/renderer/platform/network/content_security_policy_parsers.h" 
++namespace blink {
++
++PolicyData* PolicyData::Clone() const {
++  PolicyData* result = CloneInternal();
++  return result;
++}
++
++void PolicyData::AddPolicy(const String& str, const uint8_t value){
++  policy_mapping_.insert(str,value);
++  const KURL url=KURL(str);
++  Vector<UChar> characters;
++  str.AppendTo(characters);
++  Parse(characters.data(), characters.data() + characters.size(), value);
++}
++
++bool PolicyData::PoliciesMatch(const KURL& url, uint8_t value) const{
++  PolicyUrl::Permission access=static_cast<PolicyUrl::Permission>(value);
++  for (wtf_size_t i = 0; i < list_.size(); ++i){
++    if(list_[i]->Matches(url)){
++      if(access & list_[i]->GetPermission())
++        return true;
++    }
++  }
++  return false;
++}
++
++PolicyUrl::PolicyUrl(const String& scheme,
++                     const String& host,
++                     int port,
++                     const String& path,
++                     Permission permission,
++                     WildcardDisposition host_wildcard,
++                     WildcardDisposition port_wildcard)
++    : scheme_(scheme.DeprecatedLower()),
++      host_(host),
++      port_(port),
++      path_(path),
++      permission_(permission),
++      host_wildcard_(host_wildcard),
++      port_wildcard_(port_wildcard) {}
++
++PolicyUrl::PolicyUrl(const PolicyUrl& other)
++    : PolicyUrl(other.scheme_,
++                other.host_,
++                other.port_,
++                other.path_,
++                other.permission_,
++                other.host_wildcard_,
++                other.port_wildcard_) {}
++
++bool PolicyUrl::Matches(const KURL& url) const {
++  SchemeMatchingResult schemes_match = SchemeMatches(url.Protocol());
++  if (schemes_match == SchemeMatchingResult::kNotMatching)
++    return false;
++  if (IsSchemeOnly())
++    return true;
++  bool paths_match = PathMatches(url.GetPath());
++  PortMatchingResult ports_match = PortMatches(url.Port(), url.Protocol());
++
++  // if either the scheme or the port would require an upgrade (e.g. from http
++  // to https) then check that both of them can upgrade to ensure that we don't
++  // run into situations where we only upgrade the port but not the scheme or
++  // viceversa
++  if ((RequiresUpgrade(schemes_match) || (RequiresUpgrade(ports_match))) &&
++      (!CanUpgrade(schemes_match) || !CanUpgrade(ports_match))) {
++    return false;
++  }
++  return HostMatches(url.Host()) &&
++         ports_match != PortMatchingResult::kNotMatching && paths_match;
++}
++
++PolicyUrl::SchemeMatchingResult PolicyUrl::SchemeMatches(
++    const String& protocol) const {
++  DCHECK_EQ(protocol, protocol.DeprecatedLower());
++  const String& scheme = scheme_;
++      // (scheme_.IsEmpty() ? policy_->GetSelfProtocol() : scheme_);
++
++  if (scheme == protocol)
++    return SchemeMatchingResult::kMatchingExact;
++
++  if ((scheme == "http" && protocol == "https") ||
++      (scheme == "ws" && protocol == "wss")) {
++    return SchemeMatchingResult::kMatchingUpgrade;
++  }
++
++  return SchemeMatchingResult::kNotMatching;
++}
++
++bool PolicyUrl::HostMatches(const String& host) const {
++  bool match;
++
++  bool equal_hosts = EqualIgnoringASCIICase(host_, host);
++  if (host_wildcard_ == kHasWildcard) {
++    if (host_.IsEmpty()) {
++      // host-part = "*"
++      match = true;
++    } else {
++      // host-part = "*." 1*host-char *( "." 1*host-char )
++      match = host.EndsWithIgnoringCase(String("." + host_));
++    }
++  } else {
++    // host-part = 1*host-char *( "." 1*host-char )
++    match = equal_hosts;
++  }
++
++  return match;
++}
++
++bool PolicyUrl::PathMatches(const String& url_path) const {
++  if (path_.IsEmpty() || (path_ == "/" && url_path.IsEmpty()))
++    return true;
++
++  String path =
++      DecodeURLEscapeSequences(url_path, DecodeURLMode::kUTF8OrIsomorphic);
++
++  if (path_.EndsWith("/"))
++    return path.StartsWith(path_);
++
++  return path == path_;
++}
++
++PolicyUrl::PortMatchingResult PolicyUrl::PortMatches(
++    int port,
++    const String& protocol) const {
++  
++  if (port_wildcard_ == kHasWildcard)
++    return PortMatchingResult::kMatchingWildcard;
++
++  if (port == port_) {
++    if (port == 0)
++      return PortMatchingResult::kMatchingWildcard;
++    return PortMatchingResult::kMatchingExact;
++  }
++
++  if (!port) {
++    if (IsDefaultPortForProtocol(port_, protocol))
++      return PortMatchingResult::kMatchingExact;
++
++    return PortMatchingResult::kNotMatching;
++  }
++
++  if (!port_) {
++    if (IsDefaultPortForProtocol(port, protocol))
++      return PortMatchingResult::kMatchingExact;
++
++    return PortMatchingResult::kNotMatching;
++  }
++
++  return PortMatchingResult::kNotMatching;
++}
++
++bool PolicyUrl::IsSchemeOnly() const {
++  return host_.IsEmpty() && (host_wildcard_ == kNoWildcard);
++}
++
++void PolicyData::Parse(const UChar* begin, const UChar* end, const uint8_t value) {
++  // We represent 'none' as an empty m_list.
++  // if (IsSourceListNone(begin, end))
++  //   return;
++  PolicyUrl::Permission permission=static_cast<PolicyUrl::Permission>(value);
++
++  const UChar* position = begin;
++  while (position < end) {
++    SkipWhile<UChar, IsASCIISpace>(position, end);
++    if (position == end)
++      return;
++
++    const UChar* begin_source = position;
++    SkipWhile<UChar, IsSourceCharacter>(position, end);
++
++    String scheme, host, path;
++    int port = 0;
++    PolicyUrl::WildcardDisposition host_wildcard = PolicyUrl::kNoWildcard;
++    PolicyUrl::WildcardDisposition port_wildcard = PolicyUrl::kNoWildcard;
++
++    if (ParseSource(begin_source, position, &scheme, &host, &port, &path,
++                    &host_wildcard, &port_wildcard)) {
++      // Wildcard hosts and keyword sources ('self', 'unsafe-inline',
++      // etc.) aren't stored in m_list, but as attributes on the source
++      // list itself.
++      if (scheme.IsEmpty() && host.IsEmpty())
++        continue;
++      list_.push_back(MakeGarbageCollected<PolicyUrl>(
++          scheme, host, port, path, permission, host_wildcard, port_wildcard));
++    }
++
++    DCHECK(position == end || IsASCIISpace(*position));
++  }
++}
++
++// source            = scheme ":"
++//                   / ( [ scheme "://" ] host [ port ] [ path ] )
++//                   / "'self'"
++bool PolicyData::ParseSource(
++    const UChar* begin,
++    const UChar* end,
++    String* scheme,
++    String* host,
++    int* port,
++    String* path,
++    PolicyUrl::WildcardDisposition* host_wildcard,
++    PolicyUrl::WildcardDisposition* port_wildcard) {
++  if (begin == end)
++    return false;
++
++  const UChar* position = begin;
++  const UChar* begin_host = begin;
++  const UChar* begin_path = end;
++  const UChar* begin_port = nullptr;
++
++  SkipWhile<UChar, IsNotColonOrSlash>(position, end);
++
++  if (position == end) {
++    // host
++    //     ^
++    return ParseHost(begin_host, position, host, host_wildcard);
++  }
++
++  if (position < end && *position == '/') {
++    // host/path || host/ || /
++    //     ^            ^    ^
++    return ParseHost(begin_host, position, host, host_wildcard) &&
++           ParsePath(position, end, path);
++  }
++
++  if (position < end && *position == ':') {
++    if (end - position == 1) {
++      // scheme:
++      //       ^
++      return ParseScheme(begin, position, scheme);
++    }
++
++    if (position[1] == '/') {
++      // scheme://host || scheme://
++      //       ^                ^
++      if (!ParseScheme(begin, position, scheme) ||
++          !SkipExactly<UChar>(position, end, ':') ||
++          !SkipExactly<UChar>(position, end, '/') ||
++          !SkipExactly<UChar>(position, end, '/'))
++        return false;
++      if (position == end)
++        return false;
++      begin_host = position;
++      SkipWhile<UChar, IsNotColonOrSlash>(position, end);
++    }
++
++    if (position < end && *position == ':') {
++      // host:port || scheme://host:port
++      //     ^                     ^
++      begin_port = position;
++      SkipUntil<UChar>(position, end, '/');
++    }
++  }
++
++  if (position < end && *position == '/') {
++    // scheme://host/path || scheme://host:port/path
++    //              ^                          ^
++    if (position == begin_host)
++      return false;
++    begin_path = position;
++  }
++
++  if (!ParseHost(begin_host, begin_port ? begin_port : begin_path, host,
++                 host_wildcard))
++    return false;
++
++  if (begin_port) {
++    if (!ParsePort(begin_port, begin_path, port, port_wildcard))
++      return false;
++  } else {
++    *port = 0;
++  }
++
++  if (begin_path != end) {
++    if (!ParsePath(begin_path, end, path))
++      return false;
++  }
++
++  return true;
++}
++
++//                     ; <scheme> production from RFC 3986
++// scheme      = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
++//
++bool PolicyData::ParseScheme(const UChar* begin,
++                                      const UChar* end,
++                                      String* scheme) {
++  DCHECK(begin <= end);
++  DCHECK(scheme->IsEmpty());
++
++  if (begin == end)
++    return false;
++
++  const UChar* position = begin;
++
++  if (!SkipExactly<UChar, IsASCIIAlpha>(position, end))
++    return false;
++
++  SkipWhile<UChar, IsSchemeContinuationCharacter>(position, end);
++
++  if (position != end)
++    return false;
++
++  *scheme = String(begin, static_cast<wtf_size_t>(end - begin));
++  return true;
++}
++
++// host              = [ "*." ] 1*host-char *( "." 1*host-char )
++//                   / "*"
++// host-char         = ALPHA / DIGIT / "-"
++//
++// static
++bool PolicyData::ParseHost(
++    const UChar* begin,
++    const UChar* end,
++    String* host,
++    PolicyUrl::WildcardDisposition* host_wildcard) {
++  DCHECK(begin <= end);
++  DCHECK(host->IsEmpty());
++  DCHECK(*host_wildcard == PolicyUrl::kNoWildcard);
++
++  if (begin == end)
++    return false;
++
++  const UChar* position = begin;
++
++  // Parse "*" or [ "*." ].
++  if (SkipExactly<UChar>(position, end, '*')) {
++    *host_wildcard = PolicyUrl::kHasWildcard;
++
++    if (position == end) {
++      // "*"
++      return true;
++    }
++
++    if (!SkipExactly<UChar>(position, end, '.'))
++      return false;
++  }
++  const UChar* host_begin = position;
++
++  // Parse 1*host-hcar.
++  if (!SkipExactly<UChar, IsHostCharacter>(position, end))
++    return false;
++  SkipWhile<UChar, IsHostCharacter>(position, end);
++
++  // Parse *( "." 1*host-char ).
++  while (position < end) {
++    if (!SkipExactly<UChar>(position, end, '.'))
++      return false;
++    if (!SkipExactly<UChar, IsHostCharacter>(position, end))
++      return false;
++    SkipWhile<UChar, IsHostCharacter>(position, end);
++  }
++
++  *host = String(host_begin, static_cast<wtf_size_t>(end - host_begin));
++  return true;
++}
++
++bool PolicyData::ParsePath(const UChar* begin,
++                                    const UChar* end,
++                                    String* path) {
++  DCHECK(begin <= end);
++  DCHECK(path->IsEmpty());
++
++  const UChar* position = begin;
++  SkipWhile<UChar, IsPathComponentCharacter>(position, end);
++  // path/to/file.js?query=string || path/to/file.js#anchor
++  //                ^                               ^
++  
++  // if (position < end) {
++  //   policy_->ReportInvalidPathCharacter(
++  //       directive_name_, String(begin, static_cast<wtf_size_t>(end - begin)),
++  //       *position);
++  // }
++
++  *path = DecodeURLEscapeSequences(
++      String(begin, static_cast<wtf_size_t>(position - begin)),
++      DecodeURLMode::kUTF8OrIsomorphic);
++
++  DCHECK(position <= end);
++  DCHECK(position == end || (*position == '#' || *position == '?'));
++  return true;
++}
++
++// port              = ":" ( 1*DIGIT / "*" )
++//
++bool PolicyData::ParsePort(
++    const UChar* begin,
++    const UChar* end,
++    int* port,
++    PolicyUrl::WildcardDisposition* port_wildcard) {
++  DCHECK(begin <= end);
++  DCHECK_EQ(*port, 0);
++  DCHECK(*port_wildcard == PolicyUrl::kNoWildcard);
++
++  if (!SkipExactly<UChar>(begin, end, ':'))
++    NOTREACHED();
++
++  if (begin == end)
++    return false;
++
++  if (end - begin == 1 && *begin == '*') {
++    *port = 0;
++    *port_wildcard = PolicyUrl::kHasWildcard;
++    return true;
++  }
++
++  const UChar* position = begin;
++  SkipWhile<UChar, IsASCIIDigit>(position, end);
++
++  if (position != end)
++    return false;
++
++  bool ok;
++  *port = CharactersToInt(begin, end - begin, WTF::NumberParsingOptions::kNone,
++                          &ok);
++  return ok;
++}
++
++} // namespace blink
+\ No newline at end of file
+diff --git a/core/style/policy_data.h b/core/style/policy_data.h
+new file mode 100644
+index 000000000..865e6d369
+--- /dev/null
++++ b/core/style/policy_data.h
+@@ -0,0 +1,164 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_STYLE_POLICY_DATA_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_STYLE_POLICY_DATA_H_
++
++#include <memory>
++#include <utility>
++
++#include "third_party/blink/renderer/platform/wtf/forward.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#include "third_party/blink/renderer/platform/wtf/hash_map.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_hash.h"
++#include "third_party/blink/renderer/platform/heap/heap.h"
++#include "third_party/blink/renderer/platform/wtf/casting.h"
++#include "third_party/blink/renderer/platform/weborigin/kurl.h"
++#include "third_party/blink/renderer/platform/heap/heap_allocator.h"
++#include "third_party/blink/renderer/platform/heap/member.h"
++
++namespace blink {
++
++class KURL;
++
++class PolicyUrl final : public GarbageCollected<PolicyUrl> {
++ public:
++  enum WildcardDisposition { kNoWildcard, kHasWildcard }; 
++
++  enum Permission{
++    kNoPermission = 0,
++    kRead = 1,
++    kWrite = 1 << 2,
++    kAll = kRead | kWrite
++  };
++
++  enum class PortMatchingResult {
++    kNotMatching,
++    kMatchingWildcard,
++    kMatchingUpgrade,
++    kMatchingExact
++  };
++
++  enum class SchemeMatchingResult {
++    kNotMatching,
++    kMatchingUpgrade,
++    kMatchingExact
++  };
++
++  PolicyUrl(const String& scheme,
++            const String& host,
++            int port,
++            const String& path,
++            Permission permission,
++            WildcardDisposition host_wildcard,
++            WildcardDisposition port_wildcard);            
++  PolicyUrl(const PolicyUrl& other);
++  bool IsSchemeOnly() const;
++  const String& GetScheme() { return scheme_; }
++  bool Matches(const KURL&) const;
++
++  Permission GetPermission() const { return permission_; }
++
++  void Trace(Visitor*) const{}
++
++ private:
++  SchemeMatchingResult SchemeMatches(const String&) const;
++  bool HostMatches(const String&) const;
++  bool PathMatches(const String&) const;
++  // Protocol is necessary to determine default port if it is zero.
++  PortMatchingResult PortMatches(int port, const String& protocol) const;
++
++  // Helper inline functions for Port and Scheme MatchingResult enums
++  bool inline RequiresUpgrade(const PortMatchingResult result) const {
++    return result == PortMatchingResult::kMatchingUpgrade;
++  }
++  bool inline RequiresUpgrade(const SchemeMatchingResult result) const {
++    return result == SchemeMatchingResult::kMatchingUpgrade;
++  }
++
++  bool inline CanUpgrade(const PortMatchingResult result) const {
++    return result == PortMatchingResult::kMatchingUpgrade ||
++           result == PortMatchingResult::kMatchingWildcard;
++  }
++
++  bool inline CanUpgrade(const SchemeMatchingResult result) const {
++    return result == SchemeMatchingResult::kMatchingUpgrade;
++  }
++
++  String scheme_;
++  String host_;
++  int port_;
++  String path_;
++  Permission permission_;
++  WildcardDisposition host_wildcard_;
++  WildcardDisposition port_wildcard_;
++};
++
++class PolicyData final : public GarbageCollected<PolicyData> {
++  // using WTF::String;
++ public:
++  ~PolicyData() = default;
++
++  explicit PolicyData(const String& text) : text_(text) {}
++
++  const String& GetText() const { return text_; }
++  void SetText(const String& text) { text_ = text; }
++
++  bool IsText() const { return true; }
++  bool IsNone() const { return false; }
++
++  PolicyData* Clone() const;
++  bool Equals(const PolicyData& data) const {
++    return data.GetText() == GetText();
++  }
++
++  void Trace(Visitor* visitor) const{
++    visitor->Trace(list_);
++  }
++
++  using PolicyMap=HashMap<String, uint8_t>;
++
++  void AddPolicy(const String& str, uint8_t value); 
++
++  PolicyMap GetPolicyMap() const{
++    return policy_mapping_;
++  }
++
++  bool PoliciesMatch(const KURL&, uint8_t value) const;
++
++  void Parse(const UChar* begin, const UChar* end, const uint8_t value);
++
++ private:
++  PolicyData* CloneInternal() const {
++    return MakeGarbageCollected<PolicyData>(GetText());
++  }
++
++  bool ParseSource(const UChar* begin,
++                   const UChar* end,
++                   String* scheme,
++                   String* host,
++                   int* port,
++                   String* path,
++                   PolicyUrl::WildcardDisposition*,
++                   PolicyUrl::WildcardDisposition*);
++  bool ParseScheme(const UChar* begin, const UChar* end, String* scheme);
++  static bool ParseHost(const UChar* begin,
++                        const UChar* end,
++                        String* host,
++                        PolicyUrl::WildcardDisposition*);
++  bool ParsePort(const UChar* begin,
++                 const UChar* end,
++                 int* port,
++                 PolicyUrl::WildcardDisposition*);
++  bool ParsePath(const UChar* begin, const UChar* end, String* path);
++
++  String text_;
++  PolicyMap policy_mapping_;
++  HeapVector<Member<PolicyUrl>> list_;
++};
++
++inline bool operator==(const PolicyData& a,
++                              const PolicyData& b) {
++    return a.GetText()==b.GetText();
++}
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_STYLE_POLICY_DATA_H_
+diff --git a/core/style/policy_data_parser.cc b/core/style/policy_data_parser.cc
+new file mode 100644
+index 000000000..212c2b975
+--- /dev/null
++++ b/core/style/policy_data_parser.cc
+@@ -0,0 +1,60 @@
++// Copyright 2014 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/platform/network/content_security_policy_parsers.h"
++
++#include "services/network/public/mojom/content_security_policy.mojom-blink.h"
++#include "third_party/blink/renderer/platform/wtf/assertions.h"
++#include "third_party/blink/renderer/platform/wtf/text/ascii_ctype.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_utf8_adaptor.h"
++
++namespace blink {
++
++bool IsCSPDirectiveNameCharacter(UChar c) {
++  return IsASCIIAlphanumeric(c) || c == '-';
++}
++
++bool IsCSPDirectiveValueCharacter(UChar c) {
++  return IsASCIISpace(c) || (c >= 0x21 && c <= 0x7e);  // Whitespace + VCHAR
++}
++
++// Only checks for general Base64(url) encoded chars, not '=' chars since '=' is
++// positional and may only appear at the end of a Base64 encoded string.
++bool IsBase64EncodedCharacter(UChar c) {
++  return IsASCIIAlphanumeric(c) || c == '+' || c == '/' || c == '-' || c == '_';
++}
++
++bool IsNonceCharacter(UChar c) {
++  return IsBase64EncodedCharacter(c) || c == '=';
++}
++
++bool IsSourceCharacter(UChar c) {
++  return !IsASCIISpace(c);
++}
++
++bool IsPathComponentCharacter(UChar c) {
++  return c != '?' && c != '#';
++}
++
++bool IsHostCharacter(UChar c) {
++  return IsASCIIAlphanumeric(c) || c == '-';
++}
++
++bool IsSchemeContinuationCharacter(UChar c) {
++  return IsASCIIAlphanumeric(c) || c == '+' || c == '-' || c == '.';
++}
++
++bool IsNotASCIISpace(UChar c) {
++  return !IsASCIISpace(c);
++}
++
++bool IsNotColonOrSlash(UChar c) {
++  return c != ':' && c != '/';
++}
++
++bool IsMediaTypeCharacter(UChar c) {
++  return !IsASCIISpace(c) && c != '/';
++}
++
++}  // namespace blink
+diff --git a/core/style/policy_data_parsers.h b/core/style/policy_data_parsers.h
+new file mode 100644
+index 000000000..7a01072cd
+--- /dev/null
++++ b/core/style/policy_data_parsers.h
+@@ -0,0 +1,27 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_NETWORK_CONTENT_SECURITY_POLICY_PARSERS_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_NETWORK_CONTENT_SECURITY_POLICY_PARSERS_H_
++
++#include "third_party/blink/renderer/platform/crypto.h"
++#include "third_party/blink/renderer/platform/platform_export.h"
++#include "third_party/blink/renderer/platform/wtf/text/unicode.h"
++
++namespace blink {
++
++typedef std::pair<unsigned, DigestValue> CSPHashValue;
++
++PLATFORM_EXPORT bool IsCSPDirectiveNameCharacter(UChar);
++PLATFORM_EXPORT bool IsCSPDirectiveValueCharacter(UChar);
++PLATFORM_EXPORT bool IsNonceCharacter(UChar);
++PLATFORM_EXPORT bool IsSourceCharacter(UChar);
++PLATFORM_EXPORT bool IsPathComponentCharacter(UChar);
++PLATFORM_EXPORT bool IsHostCharacter(UChar);
++PLATFORM_EXPORT bool IsSchemeContinuationCharacter(UChar);
++PLATFORM_EXPORT bool IsNotASCIISpace(UChar);
++PLATFORM_EXPORT bool IsNotColonOrSlash(UChar);
++PLATFORM_EXPORT bool IsMediaTypeCharacter(UChar);
++
++PLATFORM_EXPORT bool IsBase64EncodedCharacter(UChar);
++
++}  // namespace blink
++
++#endif
+diff --git a/platform/weborigin/kurl.cc b/platform/weborigin/kurl.cc
+index 154e4e189..3391c5986 100644
+--- a/platform/weborigin/kurl.cc
++++ b/platform/weborigin/kurl.cc
+@@ -266,6 +266,9 @@ KURL::KURL(const KURL& other)
+       string_(other.string_) {
+   if (other.inner_url_.get())
+     inner_url_ = std::make_unique<KURL>(other.inner_url_->Copy());
++  if (other.JsUrlInitiator_){
++    JsUrlInitiator_=other.JsUrlInitiator_;
++  }
+ }
+ 
+ KURL::~KURL() = default;
+@@ -280,6 +283,9 @@ KURL& KURL::operator=(const KURL& other) {
+     inner_url_ = std::make_unique<KURL>(other.inner_url_->Copy());
+   else
+     inner_url_.reset();
++  if (other.JsUrlInitiator_){
++    JsUrlInitiator_=other.JsUrlInitiator_;
++  }
+   return *this;
+ }
+ 
+@@ -292,6 +298,9 @@ KURL KURL::Copy() const {
+   result.string_ = string_.IsolatedCopy();
+   if (inner_url_)
+     result.inner_url_ = std::make_unique<KURL>(inner_url_->Copy());
++  if (JsUrlInitiator_){
++    result.JsUrlInitiator_=JsUrlInitiator_;
++  }
+   return result;
+ }
+ 
+@@ -789,6 +798,9 @@ void KURL::Init(const KURL& base,
+     string_ = AtomicString::FromUTF8(output.data(), output.length());
+   }
+ 
++  if (base.JsUrlInitiator_){
++    JsUrlInitiator_=base.JsUrlInitiator_;
++  }
+   InitProtocolMetadata();
+   InitInnerURL();
+   DCHECK(!::blink::ProtocolIsJavaScript(string_) || ProtocolIsJavaScript());
+diff --git a/platform/weborigin/kurl.h b/platform/weborigin/kurl.h
+index 4e944bc2c..10c229356 100644
+--- a/platform/weborigin/kurl.h
++++ b/platform/weborigin/kurl.h
+@@ -238,6 +238,8 @@ class PLATFORM_EXPORT KURL {
+   // TODO(crbug.com/862940): Make this conversion explicit.
+   operator GURL() const;
+ 
++  String JsUrlInitiator_;
++
+  private:
+   friend struct WTF::HashTraits<blink::KURL>;
+ 

@@ -1,0 +1,84 @@
+var showHtml = function (elem) {
+};
+
+var basePath = document.getElementById('extensionpath').getAttribute("path");
+
+var aardvark = {
+
+  isBookmarklet: true,
+  resourcePrefix: basePath,
+  srcFiles: [
+    'aardvarkStrings.js',
+    'aardvarkUtils.js',
+    'aardvarkDBox.js',
+    'aardvarkCommands.js',
+    "aardvarkMain.js",
+    "uniqueSelector.js"
+  ],
+
+  moduleFiles: [
+  ],
+  sensTags: [],
+  sensSelectors: [],
+//------------------------------------------------
+// onload function for script elements
+  loadObject: function  (obj) {
+    var c = 0;
+
+    for (var x in obj) {
+      if (aardvark[x] == undefined)
+        aardvark[x] = obj[x];
+      c++;
+    }
+
+    if (this.objectsLeftToLoad == undefined) {
+      this.objectsLeftToLoad = this.srcFiles.length;
+    }
+    this.objectsLeftToLoad--;
+
+    if (this.objectsLeftToLoad < 1) {
+      // add anything here you want to happen when it is loaded
+      // copy our own functions etc over aardvark's
+
+      // start aardvark and show its help tip
+      this.start ();
+      this.showHelpTip(0);
+
+      // add our custom commands
+    }
+  }
+};
+
+
+// load the aardvark code from karmatics.com
+(function () {
+
+// leave commented out if you wish to have it load a new
+// copy each time (for dev purposes...no need to refresh page)
+  /*if (window.aardvark) {
+    aardvark.start ();
+    return;
+    } */
+
+// anti caching....dev only (leave empty string otherwise)
+  var ensureFresh = ""; // "?" + Math.round(Math.random()*100);
+
+  for (var i=0; i<aardvark.srcFiles.length; i++) {
+    var scriptElem = document.createElement('script');
+    scriptElem.isAardvark = true;
+    scriptElem.src = ((aardvark.srcFiles[i].indexOf("http://") == 0) ?
+        aardvark.srcFiles[i] : aardvark.resourcePrefix + aardvark.srcFiles[i]) + ensureFresh;
+    // scriptElem.src=aardvark.srcFiles[i];
+    
+    document.body.appendChild(scriptElem);
+  }
+
+  for (var i=0; i<aardvark.moduleFiles.length; i++) {
+    var scriptElem = document.createElement('script');
+    scriptElem.isAardvark = true;
+    scriptElem.src = ((aardvark.moduleFiles[i].indexOf("http://") == 0) ?
+        aardvark.moduleFiles[i] : aardvark.resourcePrefix + aardvark.moduleFiles[i]) + ensureFresh;
+    scriptElem.type="module";
+    document.body.appendChild(scriptElem);
+  }
+})();
